@@ -4,6 +4,9 @@ Tick-level crypto trading engine in C++. Branchless fixed-point arithmetic, bitm
 
 Built from scratch as a learning project — no frameworks, no black boxes.
 
+![FoxML Trader GUI](assets/gui-trading.png)
+![FoxML Trader Settings](assets/gui-full.png)
+
 ## Features
 
 - **Tick-level execution**: every market tick processed in <100ns on hot path
