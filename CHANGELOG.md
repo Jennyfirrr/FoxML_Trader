@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.2 — Pixel Perfect Labels <3
+
+- **unified label collision** — entry, TP, and SL labels all participate in collision detection now (entry + SL at similar prices no longer stack)
+- **equity chart padding** — 15% Y-axis padding so the P&L curve doesn't slam into top/bottom edges
+- **timestamp spacing** — capped at 5 labels max, no more overlapping time ticks
+
 ## v1.0.1 — No More Label Spaghetti <3
 
 - **chart label collision detection** — TP/SL labels that overlap within 20px now stagger horizontally so you can actually read them
