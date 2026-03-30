@@ -141,23 +141,23 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
         ImPlot::SetupAxes(NULL, NULL, ImPlotAxisFlags_NoLabel, ImPlotAxisFlags_Opposite);
         ImPlot::SetupAxisLimits(ImAxis_X1, cs->x_lo, cs->x_hi, ImPlotCond_Always);
 
-        // time tick labels — conservative spacing to prevent overlap
+        // time tick labels — static buffers so pointers survive until EndPlot
+        static double tick_pos[16];
+        static char tick_bufs[16][8];
+        static const char *tick_labels_p[16];
+        int tick_n = 0;
         if (vc > 0) {
             int step = vc > 5 ? vc / 5 : 1;
-            double tick_pos[16];
-            const char *tick_labels[16];
-            char tick_bufs[16][8];
-            int tick_n = 0;
             for (int i = 0; i < vc && tick_n < 16; i += step) {
                 if (cs->times_sec[i] < 1.0) continue;
                 tick_pos[tick_n] = cs->xs[i];
                 time_t t = (time_t)cs->times_sec[i];
                 struct tm *tm = localtime(&t);
                 snprintf(tick_bufs[tick_n], 8, "%02d:%02d", tm->tm_hour, tm->tm_min);
-                tick_labels[tick_n] = tick_bufs[tick_n];
+                tick_labels_p[tick_n] = tick_bufs[tick_n];
                 tick_n++;
             }
-            ImPlot::SetupAxisTicks(ImAxis_X1, tick_pos, tick_n, tick_labels);
+            ImPlot::SetupAxisTicks(ImAxis_X1, tick_pos, tick_n, tick_labels_p);
         }
 
         // Y limits with padding + TP/SL expansion
@@ -402,7 +402,7 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
         float lbl_offsets[48] = {};
         for (int i = 0; i < clabel_n; ) {
             int ge = i + 1;
-            while (ge < clabel_n && (clabels[ge].y_px - clabels[i].y_px) < 20.0f)
+            while (ge < clabel_n && (clabels[ge].y_px - clabels[ge - 1].y_px) < 26.0f)
                 ge++;
             for (int g = 0; g < ge - i; g++)
                 lbl_offsets[i + g] = (float)g * 65.0f;
