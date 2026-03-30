@@ -9,7 +9,9 @@ Built from scratch as a learning project — no frameworks, no black boxes.
 
 ## Features
 
-- **Tick-level execution**: every market tick processed in <100ns on hot path
+- **Tick-level execution**: every market tick processed in <100ns on hot path (47ns low)
+
+![47ns buy gate latency](assets/latency-47ns.png)
 - **Fixed-point arithmetic**: deterministic 4096-bit FPN — no floating-point rounding variance
 - **Branchless hot path**: mask-select patterns eliminate branch misprediction
 - **Regime detection**: EMA/SMA crossover with score-based classification (RANGING / TRENDING / VOLATILE)
