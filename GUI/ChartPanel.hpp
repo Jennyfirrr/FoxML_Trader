@@ -142,8 +142,9 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
         ImPlot::SetupAxisLimits(ImAxis_X1, cs->x_lo, cs->x_hi, ImPlotCond_Always);
 
         // time tick labels — spaced to prevent overlap
+        // note: can't call ImPlot::GetPlotSize() here (still in setup phase)
         if (vc > 0) {
-            float cw = ImPlot::GetPlotSize().x;
+            float cw = ImGui::GetContentRegionAvail().x;
             float label_px = ImGui::CalcTextSize("00:00").x + 20.0f;
             int max_fit = (cw > 0 && label_px > 0) ? (int)(cw / label_px) : 6;
             if (max_fit < 2) max_fit = 2;
