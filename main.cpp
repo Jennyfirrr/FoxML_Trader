@@ -1,6 +1,6 @@
-// FoxML Trader — tick-level crypto trading engine
-// Copyright (c) 2026 Jennifer Lewis
-// Licensed under the MIT License. See LICENSE file for details.
+// Copyright (c) 2026 Jennifer Lewis. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// See LICENSE file in the project root for full license text.
 
 //======================================================================================================
 // [TICK TRADER ENGINE]
@@ -267,6 +267,7 @@ int main(int argc, char *argv[]) {
     shared.quit_requested = 0;
     shared.pause_requested = 0;
     shared.reload_requested = 0;
+    shared.drag_slot = -1;
     shared.candle_acc = NULL;
 
 #ifdef USE_IMGUI_GUI
@@ -422,6 +423,24 @@ int main(int argc, char *argv[]) {
             ControllerConfig<FP> new_cfg = ControllerConfig_Load<FP>(cfg_path);
             PortfolioController_HotReload(&ctrl, new_cfg);
             fprintf(stderr, "[ENGINE] config reloaded from %s\n", cfg_path);
+        }
+        // GUI drag TP/SL pickup
+        {
+            int slot = __atomic_load_n(&shared.drag_slot, __ATOMIC_ACQUIRE);
+            if (slot >= 0 && slot < 16) {
+                int is_tp = shared.drag_is_tp;
+                double dprice = shared.drag_price;
+                __atomic_store_n(&shared.drag_slot, -1, __ATOMIC_RELEASE);
+                auto *pos = &ctrl.portfolio.positions[slot];
+                if (ctrl.portfolio.active_bitmap & (1 << slot)) {
+                    if (is_tp)
+                        pos->take_profit_price = FPN_FromDouble<FP>(dprice);
+                    else
+                        pos->stop_loss_price = FPN_FromDouble<FP>(dprice);
+                    fprintf(stderr, "[ENGINE] GUI drag: slot %d %s -> $%.2f\n",
+                            slot, is_tp ? "TP" : "SL", dprice);
+                }
+            }
         }
 #else
         if (ready & POLL_STDIN) {

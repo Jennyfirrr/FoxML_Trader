@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.5 — Drag Your TP/SL Like a Boss <3
+
+- **draggable TP/SL** — hover near a TP/SL line, cursor changes, click and drag to adjust live with real-time P&L preview, writes to engine on release
+- **P&L on labels** — TP/SL labels show +/- dollar profit instead of absolute price
+- **equity chart crosshair** — hover crosshair with P&L readout tag
+- **trade markers fixed** — now match most recent candle instead of oldest
+
 ## v1.0.4 — Why Is It Paused Though <3
 
 - **detailed pause reasons** — header now shows exactly why the gate is closed: price, volume, price+vol, long trend, warmup, cooldown, breaker, volatile, downtrend (no more vague "wait")
