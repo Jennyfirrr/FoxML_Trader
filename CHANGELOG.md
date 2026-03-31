@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.4 — Why Is It Paused Though <3
+
+- **detailed pause reasons** — header now shows exactly why the gate is closed: price, volume, price+vol, long trend, warmup, cooldown, breaker, volatile, downtrend (no more vague "wait")
+
 ## v1.0.3 — Color-Coded Positions <3
 
 - **per-position accent icons** — each position gets a unique shape (circle/square/triangle/diamond) in an accent color so you can visually group entry + TP + SL
