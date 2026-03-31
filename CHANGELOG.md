@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.7 — Chart Love <3
+
+- **EMA/SMA shaded ribbon** — green fill when EMA > SMA (uptrend), red when below — see the crossover state at a glance
+- **live price tag** — colored box on the right Y-axis tracking current price, green/red by direction
+- **EMA-SMA spread readout** — header shows `spread: ±Xσ` with color so you know how close the crossover is to flipping
+- **session high/low markers** — dim dotted lines marking the session range
+- **session dividers** — faint vertical lines at UTC hour boundaries with ASIA/EU/US/OVER labels
+- **dropdown labels** — interval and candle count selectors now labeled properly ("60 bars" etc)
+
 ## v1.0.6 — Tell Me Why <3
 
 - **detailed gate reasons** — header shows exactly why buying is paused: price, volume, price+vol, long trend, warmup, cooldown, breaker, volatile, downtrend
