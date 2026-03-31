@@ -258,7 +258,8 @@ static inline void GUI_Panel_Regime(const TUISnapshot *s) {
                               (s->current_regime == 3) ? "TRENDING_DOWN" : "RANGING";
     ImVec4 regime_color = (s->current_regime == 1) ? FoxmlColors::green :
                           (s->current_regime == 2 || s->current_regime == 3) ? FoxmlColors::red : FoxmlColors::comment;
-    const char *strat_name = (s->strategy_id == 2) ? "SIMPLE DIP" :
+    const char *strat_name = (s->strategy_id == 4) ? "EMA CROSS" :
+                              (s->strategy_id == 2) ? "SIMPLE DIP" :
                               (s->strategy_id == 1) ? "MOMENTUM" : "MEAN REVERSION";
 
     ImGui::TextColored(FoxmlColors::sand, "regime:");

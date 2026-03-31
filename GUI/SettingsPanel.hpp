@@ -93,6 +93,10 @@ static const CfgFieldDef field_defs[] = {
     {"momentum_tp_mult",      "Mom TP",       "Momentum",        CFG_FLOAT, "%.2f"},
     {"momentum_sl_mult",      "Mom SL",       "Momentum",        CFG_FLOAT, "%.2f"},
     {"momentum_r2_min",       "R² Min",       "Momentum",        CFG_FLOAT, "%.2f"},
+    // EMA Cross
+    {"emacross_dip_mult",     "Dip Mult",     "EMA Cross",       CFG_FLOAT, "%.2f"},
+    {"emacross_crossover_min","Crossover Min", "EMA Cross",       CFG_FLOAT, "%.4f"},
+    {"emacross_trail_mult",   "Trail Mult",   "EMA Cross",       CFG_FLOAT, "%.2f"},
     // Partial Exits
     {"partial_exit_pct",      "TP1 Split %%", "Partial Exits",   CFG_FLOAT, "%.2f"},
     {"tp2_mult",              "TP2 Mult",     "Partial Exits",   CFG_FLOAT, "%.2f"},
@@ -266,7 +270,7 @@ static inline void GUI_Panel_Settings(SettingsState *s, volatile sig_atomic_t *r
         {
             const char *k = fd->key;
             if      (strcmp(k, "default_strategy") == 0)
-                ImGui::SetItemTooltip("-1 = Regime Auto (MR + Momentum)\n 0 = Mean Reversion\n 1 = Momentum\n 2 = Simple Dip");
+                ImGui::SetItemTooltip("-1 = Regime Auto (MR + Momentum)\n 0 = Mean Reversion\n 1 = Momentum\n 2 = Simple Dip\n 3 = ML (model-driven)\n 4 = EMA Cross (dip below EMA in uptrend)");
             else if (strcmp(k, "entry_offset_pct") == 0)
                 ImGui::SetItemTooltip("Buy gate offset below avg/EMA price\nhigher = deeper dip required to enter");
             else if (strcmp(k, "volume_multiplier") == 0)
@@ -289,6 +293,12 @@ static inline void GUI_Panel_Settings(SettingsState *s, volatile sig_atomic_t *r
                 ImGui::SetItemTooltip("Momentum TP distance in stddev units\nscaled by R-squared at fill time");
             else if (strcmp(k, "momentum_sl_mult") == 0)
                 ImGui::SetItemTooltip("Momentum SL distance in stddev units\nscaled by R-squared at fill time");
+            else if (strcmp(k, "emacross_dip_mult") == 0)
+                ImGui::SetItemTooltip("Buy this many stddevs below EMA\n0.5 = half sigma dip");
+            else if (strcmp(k, "emacross_crossover_min") == 0)
+                ImGui::SetItemTooltip("Min EMA-SMA spread to confirm uptrend\n0.0003 = 0.03%%");
+            else if (strcmp(k, "emacross_trail_mult") == 0)
+                ImGui::SetItemTooltip("Trailing TP factor when EMA rising\n1.5 = 50%% wider trail");
             else if (strcmp(k, "gate_ema_alpha") == 0)
                 ImGui::SetItemTooltip("EMA smoothing factor\n0.99 = fast (responsive)\n0.997 = default\n0.999 = slow (stable)");
             // regime detection

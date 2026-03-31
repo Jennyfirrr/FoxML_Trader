@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.6 — Tell Me Why <3
+
+- **detailed gate reasons** — header shows exactly why buying is paused: price, volume, price+vol, long trend, warmup, cooldown, breaker, volatile, downtrend
+- **settings tooltips** — all config fields now have hover tooltips, strategy selector shows all 5 options
+
 ## v1.0.5 — Drag Your TP/SL Like a Boss <3
 
 - **draggable TP/SL** — hover near a TP/SL line, cursor changes, click and drag to adjust live with real-time P&L preview, writes to engine on release
