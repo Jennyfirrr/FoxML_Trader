@@ -404,8 +404,13 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
             int ge = i + 1;
             while (ge < clabel_n && (clabels[ge].y_px - clabels[ge - 1].y_px) < 26.0f)
                 ge++;
-            for (int g = 0; g < ge - i; g++)
-                lbl_offsets[i + g] = (float)g * 65.0f;
+            // accumulate: each label offset = sum of previous label widths
+            float running = 0;
+            for (int g = i; g < ge; g++) {
+                lbl_offsets[g] = running;
+                if (g < ge - 1)
+                    running += ImGui::CalcTextSize(clabels[g].text).x + 16.0f;
+            }
             i = ge;
         }
         for (int i = 0; i < clabel_n; i++) {
