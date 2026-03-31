@@ -1,9 +1,15 @@
 # Changelog
 
-## v1.0.2 — Labels That Actually Line Up <3
+## v1.0.2 — Chart Readability Overhaul <3
 
-- **accumulated width stagger** — each label offset = sum of all previous label widths, so they line up end-to-end
-- **manual label rendering** — ditched ImPlot::Annotation (was clamping offsets near plot edge), labels now drawn directly on the draw list with full control
+- **TP/SL lines shortened** — right 35% only, way less visual noise
+- **position fade** — older positions at 40% alpha, newest at 100%
+- **price in labels** — TP/SL labels now show the dollar amount
+- **connector brackets** — thin vertical lines linking TP↔SL per position
+- **hover crosshair** — dotted horizontal line + price tag on both price and volume charts
+- **Y grid lines** — subtle horizontal lines at each price tick for easy reading
+- **manual label rendering** — labels drawn directly on draw list, extend leftward from right edge (no clipping)
+- **accumulated width stagger** — colliding labels line up end-to-end based on actual text width
 
 ## v1.0.1 — No More Label Spaghetti <3
 
