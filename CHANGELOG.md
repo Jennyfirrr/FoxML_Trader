@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.8 — Toggle Everything <3
+
+- **overlay toggles** — checkboxes in the chart header to show/hide: Ribbon, Sessions, H/L, Tag
+- **spread & crosshair** also toggleable via code (all on by default)
+
 ## v1.0.7 — Chart Love <3
 
 - **EMA/SMA shaded ribbon** — green fill when EMA > SMA (uptrend), red when below — see the crossover state at a glance
