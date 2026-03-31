@@ -414,9 +414,15 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
             i = ge;
         }
         for (int i = 0; i < clabel_n; i++) {
-            ImPlot::Annotation(cs->x_hi - 1, clabels[i].price, clabels[i].color,
-                               ImVec2(5 + lbl_offsets[i], 0), true,
-                               "%s", clabels[i].text);
+            ImVec2 anchor = ImPlot::PlotToPixels(cs->x_hi - 1, clabels[i].price);
+            float x0 = anchor.x + 6 + lbl_offsets[i];
+            ImVec2 tsz = ImGui::CalcTextSize(clabels[i].text);
+            float pad = 4.0f;
+            ImVec2 tl(x0, anchor.y - tsz.y * 0.5f - pad);
+            ImVec2 br(x0 + tsz.x + pad * 2, anchor.y + tsz.y * 0.5f + pad);
+            ImVec4 &c = clabels[i].color;
+            dl->AddRectFilled(tl, br, ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, 0.85f)), 3.0f);
+            dl->AddText(ImVec2(x0 + pad, tl.y + pad), IM_COL32(255,255,255,230), clabels[i].text);
         }
 
         // buy gate threshold — cyan, thick dotted, distinct from entry/TP/SL
