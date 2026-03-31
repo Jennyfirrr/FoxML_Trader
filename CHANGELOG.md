@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.3 — Color-Coded Positions <3
+
+- **per-position accent icons** — each position gets a unique shape (circle/square/triangle/diamond) in an accent color so you can visually group entry + TP + SL
+- **full-width TP/SL lines** — reverted from 35% for easier price tracing
+- **accent-tinted dashed lines** — each position's lines have a slight color shift matching their icon
+- **fixed double-counted icon width** — labels no longer overlap in collision groups
+- **removed connector brackets** — replaced by the cleaner icon system
+
 ## v1.0.2 — Chart Readability Overhaul <3
 
 - **TP/SL lines shortened** — right 35% only, way less visual noise

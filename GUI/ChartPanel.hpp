@@ -463,7 +463,7 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
         for (int i = 0; i < clabel_n; i++) {
             ImVec2 anchor = ImPlot::PlotToPixels(0, clabels[i].price);
             float box_r = right_edge - lbl_offsets[i];
-            float box_l = box_r - lbl_widths[i] - icon_w;
+            float box_l = box_r - lbl_widths[i];
             ImVec2 tsz = ImGui::CalcTextSize(clabels[i].text);
             float cy = anchor.y;
             ImVec2 tl(box_l, cy - tsz.y * 0.5f - lpad);
