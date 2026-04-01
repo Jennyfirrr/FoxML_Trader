@@ -9,6 +9,7 @@ plans/
 .chart-venv/
 
 # private configs — never commit actual trading params or keys
+# use engine.cfg.example as reference
 engine.cfg
 CoreFrameworks/controller.cfg
 *.env

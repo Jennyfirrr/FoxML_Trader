@@ -1,6 +1,6 @@
-// FoxML Trader — tick-level crypto trading engine
-// Copyright (c) 2026 Jennifer Lewis
-// Licensed under the MIT License. See LICENSE file for details.
+// Copyright (c) 2026 Jennifer Lewis. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// See LICENSE file in the project root for full license text.
 
 //======================================================================================================
 // [CONTROLLER CONFIG]
@@ -81,7 +81,8 @@ template <unsigned F> struct ControllerConfig {
   FPN<F> min_hold_gain_pct;   // only time-exit if gain < this % (e.g. 0.001 = 0.1%)
   // regime detection
   FPN<F> regime_slope_threshold;  // relative slope magnitude for TRENDING (legacy, kept for compat)
-  FPN<F> regime_crossover_threshold; // EMA/SMA spread magnitude for TRENDING (e.g. 0.0005 = 0.05%)
+  FPN<F> regime_crossover_threshold; // EMA/SMA spread for mild trend (e.g. 0.0005 = EMA Cross)
+  FPN<F> regime_strong_crossover;   // EMA/SMA spread for strong trend (e.g. 0.0015 = Momentum)
   FPN<F> regime_r2_threshold;     // min R² for TRENDING (e.g. 0.70)
   FPN<F> regime_volatile_stddev;  // stddev/price ratio for VOLATILE (legacy, kept for compat)
   FPN<F> regime_vol_spike_ratio;  // variance ratio threshold: short/long variance > this = volatile spike
@@ -98,6 +99,10 @@ template <unsigned F> struct ControllerConfig {
   FPN<F> momentum_breakout_mult;  // buy when price > avg + stddev * this (e.g. 1.5)
   FPN<F> momentum_tp_mult;        // TP multiplier for momentum (e.g. 3.0 stddevs)
   FPN<F> momentum_sl_mult;        // SL multiplier for momentum (e.g. 1.0 stddevs)
+  // EMA cross strategy
+  FPN<F> emacross_dip_mult;       // buy this many stddevs below EMA (e.g. 0.5)
+  FPN<F> emacross_crossover_min;  // min EMA-SMA spread for uptrend confirmation
+  FPN<F> emacross_trail_mult;     // trailing TP factor when EMA rising
   // volume spike detection
   FPN<F> spike_threshold;         // volume spike ratio (current/max) to trigger (e.g. 5.0 = 5x)
   FPN<F> spike_spacing_reduction; // spacing multiplier during spike (e.g. 0.5 = half normal)
@@ -146,6 +151,10 @@ template <unsigned F> struct ControllerConfig {
   int regime_model_backend;      // 0=disabled, 1=xgboost, 2=lightgbm
   char regime_model_path[256];   // path to regime enrichment model
   FPN<F> regime_model_weight;    // score weight in Regime_Classify (e.g. 2)
+  // danger gradient (hot-path crash protection)
+  int danger_enabled;            // 0=disabled, 1=enabled
+  FPN<F> danger_warn_stddevs;    // gradient starts at this many stddevs below avg (e.g. 3.0)
+  FPN<F> danger_crash_stddevs;   // full gate kill at this many stddevs below avg (e.g. 6.0)
 };
 //======================================================================================================
 template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
@@ -200,7 +209,8 @@ template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
   cfg.min_hold_gain_pct = FPN_FromDouble<F>(0.001); // 0.1% — only time-exit if below this gain
   // regime detection
   cfg.regime_slope_threshold = FPN_FromDouble<F>(0.00002); // legacy (unused by crossover classifier)
-  cfg.regime_crossover_threshold = FPN_FromDouble<F>(0.0005); // 0.05% EMA-SMA gap = trending (~$35 at BTC $70k)
+  cfg.regime_crossover_threshold = FPN_FromDouble<F>(0.0005); // 0.05% EMA-SMA gap = mild trend (~$35 at BTC $70k)
+  cfg.regime_strong_crossover = FPN_FromDouble<F>(0.0015);   // 0.15% EMA-SMA gap = strong trend (~$102 at BTC $68k)
   cfg.regime_r2_threshold    = FPN_FromDouble<F>(0.70);   // 70% consistency for trending
   cfg.regime_volatile_stddev = FPN_FromDouble<F>(0.0005); // 0.05% stddev/price (legacy compat)
   cfg.regime_vol_spike_ratio = FPN_FromDouble<F>(2.0);   // variance spike: 2x baseline = volatile
@@ -214,6 +224,10 @@ template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
   cfg.momentum_breakout_mult = FPN_FromDouble<F>(1.5);    // buy 1.5σ above avg
   cfg.momentum_tp_mult       = FPN_FromDouble<F>(3.0);    // wider TP for trends
   cfg.momentum_sl_mult       = FPN_FromDouble<F>(1.0);    // tighter SL than MR
+  // EMA cross strategy
+  cfg.emacross_dip_mult      = FPN_FromDouble<F>(0.5);    // buy 0.5σ below EMA
+  cfg.emacross_crossover_min = FPN_FromDouble<F>(0.0003);  // 0.03% min spread
+  cfg.emacross_trail_mult    = FPN_FromDouble<F>(1.5);    // 1.5x trail when EMA rising
   // volume spike detection
   cfg.spike_threshold         = FPN_FromDouble<F>(5.0);    // 5x rolling max triggers spike
   cfg.spike_spacing_reduction = FPN_FromDouble<F>(0.5);    // half spacing on spike
@@ -256,6 +270,10 @@ template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
   cfg.regime_model_backend = 0;
   cfg.regime_model_path[0] = '\0';
   cfg.regime_model_weight = FPN_FromDouble<F>(2.0);
+  // danger gradient
+  cfg.danger_enabled = 1;
+  cfg.danger_warn_stddevs = FPN_FromDouble<F>(3.0);    // gradient starts at 3σ below avg
+  cfg.danger_crash_stddevs = FPN_FromDouble<F>(6.0);   // full gate kill at 6σ below avg
   return cfg;
 }
 //======================================================================================================
@@ -348,11 +366,15 @@ inline ControllerConfig<F> ControllerConfig_Load(const char *filepath) {
     CFG_PARSE_FPN(breakout_min)
     CFG_PARSE_FPN(regime_slope_threshold)
     CFG_PARSE_FPN(regime_crossover_threshold)
+    CFG_PARSE_FPN(regime_strong_crossover)
     CFG_PARSE_FPN(regime_volatile_stddev)
     CFG_PARSE_FPN(regime_vol_spike_ratio)
     CFG_PARSE_FPN(momentum_breakout_mult)
     CFG_PARSE_FPN(momentum_tp_mult)
     CFG_PARSE_FPN(momentum_sl_mult)
+    CFG_PARSE_FPN(emacross_dip_mult)
+    CFG_PARSE_FPN(emacross_crossover_min)
+    CFG_PARSE_FPN(emacross_trail_mult)
     CFG_PARSE_FPN(spike_threshold)
     CFG_PARSE_FPN(spike_spacing_reduction)
     CFG_PARSE_FPN(session_asian_mult)
@@ -430,6 +452,9 @@ inline ControllerConfig<F> ControllerConfig_Load(const char *filepath) {
     CFG_PARSE_FPN(no_trade_band_mult)
     CFG_PARSE_FPN(ml_buy_threshold)
     CFG_PARSE_FPN(regime_model_weight)
+    CFG_PARSE_INT(danger_enabled)
+    CFG_PARSE_FPN(danger_warn_stddevs)
+    CFG_PARSE_FPN(danger_crash_stddevs)
 
     // ML model paths (string fields — not atof)
     if (strcmp(key, "ml_model_path") == 0) {

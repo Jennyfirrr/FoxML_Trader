@@ -65,8 +65,8 @@ static inline void engine_force_close_all(PortfolioController<FP> *ctrl, TradeLo
         FPN<FP> exit_fee = FPN_Mul(gross_proceeds, ctrl->config.fee_rate);
         FPN<FP> net_proceeds = FPN_SubSat(gross_proceeds, exit_fee);
         FPN<FP> entry_cost = FPN_Mul(pos->entry_price, pos->quantity);
-        FPN<FP> entry_fee = FPN_Mul(entry_cost, ctrl->config.fee_rate);
-        FPN<FP> pos_pnl = FPN_Sub(net_proceeds, FPN_AddSat(entry_cost, entry_fee));
+        // use actual entry fee stored at fill time (not reconstructed from current fee_rate)
+        FPN<FP> pos_pnl = FPN_Sub(net_proceeds, FPN_AddSat(entry_cost, pos->entry_fee));
 
         ctrl->balance = FPN_AddSat(ctrl->balance, net_proceeds);
         ctrl->realized_pnl = FPN_AddSat(ctrl->realized_pnl, pos_pnl);
@@ -406,6 +406,9 @@ int main(int argc, char *argv[]) {
             else {
                 ctrl.buy_conds.price  = FPN_Zero<FP>();
                 ctrl.buy_conds.volume = FPN_Zero<FP>();
+                ctrl.buying_halted = 1;
+                ctrl.halt_reason = 6;
+                ctrl.gate_offset = FPN_Zero<FP>();
             }
         }
         if (__atomic_exchange_n(&shared.regime_cycle_requested, 0, __ATOMIC_ACQ_REL))
@@ -455,6 +458,9 @@ int main(int argc, char *argv[]) {
             // disable buy gate during wind-down
             ctrl.buy_conds.price  = FPN_Zero<FP>();
             ctrl.buy_conds.volume = FPN_Zero<FP>();
+            ctrl.buying_halted = 1;
+            ctrl.halt_reason = 5;
+            ctrl.gate_offset = FPN_Zero<FP>();
         }
 
         if (BinanceStream_ShouldReconnect(&bs)) {
@@ -809,9 +815,7 @@ int main(int argc, char *argv[]) {
                     // lightweight status line — shows real equity (USDT + BTC)
                     fprintf(stderr, "[LIVE] $%.2f %s pos:%d/%d live:%d bal:$%.2f btc:%.8f equity:$%.2f W:%d L:%d\n",
                             last_stream.price_d,
-                            ctrl.regime.current_regime == 1 ? "TREND" :
-                            ctrl.regime.current_regime == 2 ? "VOLAT" :
-                            ctrl.regime.current_regime == 3 ? "TR_DN" : "RANGE",
+                            REGIME_INFO[ctrl.regime.current_regime < NUM_REGIMES ? ctrl.regime.current_regime : 0].short_name,
                             __builtin_popcount(ctrl.portfolio.active_bitmap), 16,
                             __builtin_popcount(live_position_bitmap),
                             usdt_bal, btc_bal, usdt_bal + btc_value,
@@ -992,6 +996,7 @@ int main(int argc, char *argv[]) {
 #else
     TUI_Cleanup(&tui);
 #endif
+    TradeLogBuffer_Drain(&ctrl.trade_buf, &log);
     TradeLog_Close(&log);
     MetricsLog_Close(&metrics);
     BinanceStream_Close(&bs);

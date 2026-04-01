@@ -1,6 +1,6 @@
-// FoxML Trader — tick-level crypto trading engine
-// Copyright (c) 2026 Jennifer Lewis
-// Licensed under the MIT License. See LICENSE file for details.
+// Copyright (c) 2026 Jennifer Lewis. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// See LICENSE file in the project root for full license text.
 
 //======================================================================================================
 // [MEAN REVERSION STRATEGY]
@@ -427,7 +427,8 @@ inline BuySideGateConditions<F> MeanReversion_BuySignal(
     // vwap_deviation is (price - vwap) / vwap — negative means below VWAP
     // pass when deviation <= -vwap_offset (price is sufficiently below VWAP)
     FPN<F> neg_offset = FPN_Negate(cfg->vwap_offset);
-    int vwap_pass = FPN_LessThanOrEqual(rolling->vwap_deviation, neg_offset);
+    int vwap_pass =
+        FPN_LessThanOrEqual(rolling->vwap_deviation, neg_offset);
     int vwap_ok = vwap_pass | !vwap_enabled;
     Gate_Zero(&conds, vwap_ok);
   }
@@ -517,8 +518,7 @@ inline void MeanReversion_ExitAdjust(Portfolio<F> *portfolio,
 
       // SL floor: enforce 2:1 min reward/risk after trailing adjustments
       // only applies when SL is still below entry (at-risk position).
-      // once SL trails above entry, the position is a guaranteed win — no floor
-      // needed
+      // once SL trails above entry, the position is a guaranteed win — no floor needed
       if (FPN_LessThan(pos->stop_loss_price, pos->entry_price)) {
         FPN<F> tp_dist = FPN_Sub(pos->take_profit_price, pos->entry_price);
         FPN<F> min_sl_dist = FPN_Mul(tp_dist, FPN_FromDouble<F>(0.5));

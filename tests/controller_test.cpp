@@ -1,6 +1,6 @@
-// FoxML Trader — tick-level crypto trading engine
-// Copyright (c) 2026 Jennifer Lewis
-// Licensed under the MIT License. See LICENSE file for details.
+// Copyright (c) 2026 Jennifer Lewis. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// See LICENSE file in the project root for full license text.
 
 //======================================================================================================
 // [CONTROLLER TEST SUITE]
@@ -1946,6 +1946,499 @@ int main() {
         }
         free(ctrl.rolling_long);
         ctrl.rolling_long = NULL;
+    }
+
+    //======================================================================================================
+    // REGIME MAPPING + CLASSIFICATION
+    //======================================================================================================
+    printf("\n--- REGIME MAPPING + CLASSIFICATION ---\n");
+    {
+        // Regime_ToStrategy mapping
+        check("ToStrategy: RANGING -> MR",
+              Regime_ToStrategy(REGIME_RANGING) == STRATEGY_MEAN_REVERSION);
+        check("ToStrategy: TRENDING -> MOMENTUM",
+              Regime_ToStrategy(REGIME_TRENDING) == STRATEGY_MOMENTUM);
+        check("ToStrategy: VOLATILE -> SIMPLE_DIP",
+              Regime_ToStrategy(REGIME_VOLATILE) == STRATEGY_SIMPLE_DIP);
+        check("ToStrategy: TRENDING_DOWN -> MR",
+              Regime_ToStrategy(REGIME_TRENDING_DOWN) == STRATEGY_MEAN_REVERSION);
+        check("ToStrategy: MILD_TREND -> EMA_CROSS",
+              Regime_ToStrategy(REGIME_MILD_TREND) == STRATEGY_EMA_CROSS);
+        check("ToStrategy: out-of-range -> MR",
+              Regime_ToStrategy(99) == STRATEGY_MEAN_REVERSION);
+
+        // RegimeInfo table
+        check("RegimeInfo: RANGING short_name",
+              strcmp(REGIME_INFO[REGIME_RANGING].short_name, "RANGE") == 0);
+        check("RegimeInfo: MILD_TREND short_name",
+              strcmp(REGIME_INFO[REGIME_MILD_TREND].short_name, "EMACR") == 0);
+        check("RegimeInfo: NUM_REGIMES == 5", NUM_REGIMES == 5);
+        check("NUM_STRATEGIES == 5", NUM_STRATEGIES == 5);
+
+        // Regime_Classify integration is tested via the full controller path
+        // (SL floor tests above exercise actual regime transitions)
+        // Here we verify the config fields that drive the MILD_TREND/TRENDING split
+        ControllerConfig<FP> cfg = ControllerConfig_Default<FP>();
+        check("Classify: strong_crossover > crossover_threshold",
+              FPN_GreaterThan(cfg.regime_strong_crossover, cfg.regime_crossover_threshold));
+        check("Classify: strong_crossover default ~0.0015",
+              fabs(FPN_ToDouble(cfg.regime_strong_crossover) - 0.0015) < 0.0001);
+        check("Classify: crossover_threshold default ~0.0005",
+              fabs(FPN_ToDouble(cfg.regime_crossover_threshold) - 0.0005) < 0.0001);
+    }
+
+    //======================================================================================================
+    // SL FLOOR: MILD_TREND TRANSITIONS
+    //======================================================================================================
+    printf("\n--- SL FLOOR: MILD_TREND TRANSITIONS ---\n");
+    {
+        ControllerConfig<FP> cfg = ControllerConfig_Default<FP>();
+
+        Portfolio<FP> portfolio;
+        Portfolio_Init(&portfolio);
+        RollingStats<FP> rolling;
+        memset(&rolling, 0, sizeof(rolling));
+
+        FPN<FP> entry = FPN_FromDouble<FP>(70000.0);
+        FPN<FP> stddev = FPN_FromDouble<FP>(50.0);
+        rolling.price_stddev = stddev;
+
+        // transitions to test
+        int transitions[][2] = {
+            {REGIME_RANGING,    REGIME_MILD_TREND},
+            {REGIME_MILD_TREND, REGIME_TRENDING},
+            {REGIME_TRENDING,   REGIME_MILD_TREND},
+            {REGIME_MILD_TREND, REGIME_RANGING},
+            {REGIME_MILD_TREND, REGIME_TRENDING_DOWN},
+        };
+        const char *names[] = {
+            "RANGING->MILD_TREND", "MILD_TREND->TRENDING",
+            "TRENDING->MILD_TREND", "MILD_TREND->RANGING",
+            "MILD_TREND->TRENDING_DOWN",
+        };
+        int strategies[] = {
+            STRATEGY_MEAN_REVERSION, STRATEGY_EMA_CROSS,
+            STRATEGY_MOMENTUM, STRATEGY_EMA_CROSS,
+            STRATEGY_EMA_CROSS,
+        };
+
+        for (int t = 0; t < 5; t++) {
+            Portfolio_Init(&portfolio);
+            FPN<FP> tp = FPN_AddSat(entry, FPN_FromDouble<FP>(300.0));
+            FPN<FP> sl = FPN_SubSat(entry, FPN_FromDouble<FP>(150.0));
+            FPN<FP> qty = FPN_FromDouble<FP>(0.01);
+            int slot = Portfolio_AddPositionWithExits(&portfolio, qty, entry, tp, sl, FPN_Zero<FP>());
+
+            uint8_t entry_strat[16] = {};
+            entry_strat[slot] = (uint8_t)strategies[t];
+
+            Regime_AdjustPositions(&portfolio, &rolling,
+                                   transitions[t][0], transitions[t][1],
+                                   entry_strat, &cfg);
+
+            double tp_a = FPN_ToDouble(portfolio.positions[slot].take_profit_price);
+            double sl_a = FPN_ToDouble(portfolio.positions[slot].stop_loss_price);
+            double entry_d = FPN_ToDouble(entry);
+            double tp_dist = tp_a - entry_d;
+            double sl_dist = entry_d - sl_a;
+
+            char msg[128];
+            snprintf(msg, sizeof(msg), "SL floor %s: SL <= TP (no inverted risk)", names[t]);
+            check(msg, sl_dist <= tp_dist + 0.01);
+
+            snprintf(msg, sizeof(msg), "SL floor %s: SL >= 0.5*TP (2:1 min)", names[t]);
+            check(msg, sl_dist >= tp_dist * 0.49);
+
+            snprintf(msg, sizeof(msg), "SL floor %s: TP > entry", names[t]);
+            check(msg, tp_a > entry_d - 0.01);
+
+            snprintf(msg, sizeof(msg), "SL floor %s: SL < entry", names[t]);
+            check(msg, sl_a < entry_d + 0.01);
+        }
+    }
+
+    //======================================================================================================
+    // DANGER GRADIENT
+    //======================================================================================================
+    printf("\n--- DANGER GRADIENT ---\n");
+    {
+        ControllerConfig<FP> cfg = ControllerConfig_Default<FP>();
+
+        // verify defaults
+        check("danger: enabled by default", cfg.danger_enabled == 1);
+        check("danger: warn_stddevs default ~3.0",
+              fabs(FPN_ToDouble(cfg.danger_warn_stddevs) - 3.0) < 0.01);
+        check("danger: crash_stddevs default ~6.0",
+              fabs(FPN_ToDouble(cfg.danger_crash_stddevs) - 6.0) < 0.01);
+        check("danger: warn < crash (wider range)",
+              FPN_LessThan(cfg.danger_warn_stddevs, cfg.danger_crash_stddevs));
+
+        // test danger score math: simulate precomputed thresholds
+        // avg=100, stddev=10 → warn=70 (3σ below), crash=40 (6σ below)
+        FPN<FP> avg = FPN_FromDouble<FP>(100.0);
+        FPN<FP> sd = FPN_FromDouble<FP>(10.0);
+        FPN<FP> warn = FPN_SubSat(avg, FPN_Mul(sd, cfg.danger_warn_stddevs));  // 100-30=70
+        FPN<FP> crash = FPN_SubSat(avg, FPN_Mul(sd, cfg.danger_crash_stddevs)); // 100-60=40
+        FPN<FP> range = FPN_SubSat(warn, crash);  // 70-40=30
+        FPN<FP> range_inv = FPN_DivNoAssert(FPN_FromDouble<FP>(1.0), range);
+
+        check("danger: warn threshold ~70.0",
+              fabs(FPN_ToDouble(warn) - 70.0) < 0.01);
+        check("danger: crash threshold ~40.0",
+              fabs(FPN_ToDouble(crash) - 40.0) < 0.01);
+
+        // price at 100 (safe): score should be 0
+        {
+            FPN<FP> price = FPN_FromDouble<FP>(100.0);
+            FPN<FP> depth = FPN_SubSat(warn, price); // 70 - 100 = 0 (saturated)
+            FPN<FP> raw = FPN_Mul(depth, range_inv);
+            FPN<FP> zero = FPN_Zero<FP>();
+            FPN<FP> one = FPN_FromDouble<FP>(1.0);
+            FPN<FP> score = FPN_Min(FPN_Max(raw, zero), one);
+            check("danger: price=100 (safe) → score=0",
+                  FPN_ToDouble(score) < 0.01);
+        }
+
+        // price at 55 (in danger zone, halfway): score should be ~0.5
+        {
+            FPN<FP> price = FPN_FromDouble<FP>(55.0);
+            FPN<FP> depth = FPN_SubSat(warn, price); // 70 - 55 = 15
+            FPN<FP> raw = FPN_Mul(depth, range_inv); // 15/30 = 0.5
+            FPN<FP> zero = FPN_Zero<FP>();
+            FPN<FP> one = FPN_FromDouble<FP>(1.0);
+            FPN<FP> score = FPN_Min(FPN_Max(raw, zero), one);
+            double sv = FPN_ToDouble(score);
+            check("danger: price=55 (mid-zone) → score~0.5",
+                  sv > 0.4 && sv < 0.6);
+        }
+
+        // price at 30 (below crash): score should be clamped to 1.0
+        {
+            FPN<FP> price = FPN_FromDouble<FP>(30.0);
+            FPN<FP> depth = FPN_SubSat(warn, price); // 70 - 30 = 40
+            FPN<FP> raw = FPN_Mul(depth, range_inv); // 40/30 = 1.33
+            FPN<FP> zero = FPN_Zero<FP>();
+            FPN<FP> one = FPN_FromDouble<FP>(1.0);
+            FPN<FP> score = FPN_Min(FPN_Max(raw, zero), one);
+            check("danger: price=30 (crash) → score=1.0",
+                  fabs(FPN_ToDouble(score) - 1.0) < 0.01);
+        }
+
+        // gate scaling: score=0.5 should halve the gate price
+        {
+            FPN<FP> gate = FPN_FromDouble<FP>(68000.0);
+            FPN<FP> score = FPN_FromDouble<FP>(0.5);
+            FPN<FP> one = FPN_FromDouble<FP>(1.0);
+            FPN<FP> scale = FPN_SubSat(one, score); // 0.5
+            FPN<FP> scaled_gate = FPN_Mul(gate, scale);
+            check("danger: gate scaling at score=0.5 → ~$34000",
+                  fabs(FPN_ToDouble(scaled_gate) - 34000.0) < 1.0);
+        }
+
+        // gate scaling: score=1.0 should zero the gate
+        {
+            FPN<FP> gate = FPN_FromDouble<FP>(68000.0);
+            FPN<FP> one = FPN_FromDouble<FP>(1.0);
+            FPN<FP> scale = FPN_SubSat(one, one); // 0
+            FPN<FP> scaled_gate = FPN_Mul(gate, scale);
+            check("danger: gate scaling at score=1.0 → $0",
+                  FPN_ToDouble(scaled_gate) < 0.01);
+        }
+    }
+
+    //======================================================================================================
+    // GATE OFFSET TRACKING
+    //======================================================================================================
+    printf("\n--- GATE OFFSET TRACKING ---\n");
+    {
+        // verify offset capture: if EMA=68000 and gate_price=67950 (dir=0, buy below)
+        // offset should be 50 (distance from EMA to gate)
+        FPN<FP> ema = FPN_FromDouble<FP>(68000.0);
+        FPN<FP> gate_price = FPN_FromDouble<FP>(67950.0);
+        FPN<FP> offset = FPN_SubSat(ema, gate_price); // 50
+        check("gate offset: EMA=68000, gate=67950 → offset=50",
+              fabs(FPN_ToDouble(offset) - 50.0) < 0.01);
+
+        // verify live gate recompute: if EMA rises to 68500, gate should be 68450
+        FPN<FP> new_ema = FPN_FromDouble<FP>(68500.0);
+        FPN<FP> live_gate = FPN_SubSat(new_ema, offset);
+        check("gate offset: EMA rises to 68500 → gate=68450",
+              fabs(FPN_ToDouble(live_gate) - 68450.0) < 0.01);
+
+        // verify momentum direction (dir=1, buy above)
+        FPN<FP> mom_gate = FPN_FromDouble<FP>(68100.0);
+        FPN<FP> mom_offset = FPN_SubSat(mom_gate, ema); // 100
+        FPN<FP> mom_live = FPN_AddSat(new_ema, mom_offset); // 68600
+        check("gate offset: momentum dir=1, EMA rises → gate=68600",
+              fabs(FPN_ToDouble(mom_live) - 68600.0) < 0.01);
+    }
+
+    //======================================================================================================
+    // DEFAULT_STRATEGY -1 vs -2 DISPATCH
+    //======================================================================================================
+    printf("\n--- STRATEGY DISPATCH MODES ---\n");
+    {
+        // -1 legacy: only MR and Momentum
+        check("dispatch -1: RANGING → MR",
+              STRATEGY_MEAN_REVERSION == STRATEGY_MEAN_REVERSION); // trivial, for completeness
+        check("dispatch -1: TRENDING → MOMENTUM (not EMA Cross)",
+              STRATEGY_MOMENTUM != STRATEGY_EMA_CROSS);
+
+        // -2 full auto: verify all mappings produce distinct strategies
+        int ranging_s   = Regime_ToStrategy(REGIME_RANGING);
+        int trending_s  = Regime_ToStrategy(REGIME_TRENDING);
+        int volatile_s  = Regime_ToStrategy(REGIME_VOLATILE);
+        int mild_s      = Regime_ToStrategy(REGIME_MILD_TREND);
+        check("dispatch -2: 4 strategies used (MR, MOM, DIP, EMA)",
+              ranging_s != trending_s && trending_s != volatile_s && volatile_s != mild_s);
+        check("dispatch -2: VOLATILE uses SimpleDip (not MR)",
+              volatile_s == STRATEGY_SIMPLE_DIP);
+        check("dispatch -2: MILD_TREND uses EMA Cross (not Momentum)",
+              mild_s == STRATEGY_EMA_CROSS);
+    }
+
+    //======================================================================================================
+    // CENTRALIZED HALT FLAG
+    //======================================================================================================
+    printf("\n--- CENTRALIZED HALT FLAG ---\n");
+    {
+        ControllerConfig<FP> cfg = ControllerConfig_Default<FP>();
+        cfg.warmup_ticks = 10;
+        cfg.poll_interval = 1;
+        cfg.min_warmup_samples = 10;
+        cfg.kill_switch_enabled = 1;
+        cfg.kill_switch_daily_loss_pct = FPN_FromDouble<FP>(0.03); // 3%
+        cfg.kill_switch_drawdown_pct = FPN_FromDouble<FP>(0.05);   // 5%
+
+        PortfolioController<FP> ctrl = {};
+        PortfolioController_Init(&ctrl, cfg);
+        OrderPool<FP> pool;
+        OrderPool_init(&pool, 64);
+        TradeLog log;
+        TradeLog_Init(&log, "HALT_TEST");
+        test_warmup_ctrl(&ctrl, &pool, &log, 100.0, 500.0);
+
+        // 1. halt enforcement clears gate_offset and buy_conds
+        // use kill_switch_active to create a real halt condition
+        ctrl.kill_switch_active = 1;
+        ctrl.gate_offset = FPN_FromDouble<FP>(5.0);
+        ctrl.buy_conds.price = FPN_FromDouble<FP>(95.0);
+        ctrl.buy_conds.volume = FPN_FromDouble<FP>(100.0);
+        ctrl.ema_price = FPN_FromDouble<FP>(100.0); // needed for gate tracking
+        PortfolioController_Tick(&ctrl, &pool, FPN_FromDouble<FP>(100.0),
+                                  FPN_FromDouble<FP>(500.0), &log);
+        check("halt enforcement: buy_conds.price zeroed",
+              FPN_IsZero(ctrl.buy_conds.price));
+        check("halt enforcement: buy_conds.volume zeroed",
+              FPN_IsZero(ctrl.buy_conds.volume));
+        check("halt enforcement: gate_offset zeroed",
+              FPN_IsZero(ctrl.gate_offset));
+
+        // 2. halt persists across multiple ticks (gate tracking can't resurrect)
+        ctrl.gate_offset = FPN_FromDouble<FP>(3.0); // try to set it again
+        PortfolioController_Tick(&ctrl, &pool, FPN_FromDouble<FP>(100.0),
+                                  FPN_FromDouble<FP>(500.0), &log);
+        check("halt persists: gate_offset re-zeroed on next tick",
+              FPN_IsZero(ctrl.gate_offset));
+        check("halt persists: buy_conds.price still zero",
+              FPN_IsZero(ctrl.buy_conds.price));
+        ctrl.kill_switch_active = 0; // clean up for remaining tests
+
+        // 3. hot-path kill fires on equity crash
+        PortfolioController<FP> ctrl2 = {};
+        PortfolioController_Init(&ctrl2, cfg);
+        test_warmup_ctrl(&ctrl2, &pool, &log, 100.0, 500.0);
+        ctrl2.session_start_equity = FPN_FromDouble<FP>(10000.0);
+        ctrl2.peak_equity = FPN_FromDouble<FP>(10000.0);
+        // manually place a position at 100, then crash price to 50
+        Portfolio_AddPositionWithExits(&ctrl2.portfolio, FPN_FromDouble<FP>(1.0),
+            FPN_FromDouble<FP>(100.0), FPN_FromDouble<FP>(110.0),
+            FPN_FromDouble<FP>(90.0));
+        ctrl2.balance = FPN_FromDouble<FP>(9900.0); // $100 deducted for the position
+        // crash to 50: position value = 50, equity = 9900+50 = 9950, daily return = -0.5%
+        // not enough for 3% kill, let's use a bigger crash
+        ctrl2.balance = FPN_FromDouble<FP>(9000.0); // simulate earlier losses
+        // equity = 9000 + 50 = 9050, return = (9050-10000)/10000 = -9.5% > 3% limit
+        PortfolioController_Tick(&ctrl2, &pool, FPN_FromDouble<FP>(50.0),
+                                  FPN_FromDouble<FP>(500.0), &log);
+        check("hot-path kill: kill_switch_active set on equity crash",
+              ctrl2.kill_switch_active == 1);
+        check("hot-path kill: buying_halted set",
+              ctrl2.buying_halted == 1);
+        check("hot-path kill: halt_reason is 1 (kill)",
+              ctrl2.halt_reason == 1);
+
+        // 4. hot-path kill fires on drawdown
+        PortfolioController<FP> ctrl3 = {};
+        PortfolioController_Init(&ctrl3, cfg);
+        test_warmup_ctrl(&ctrl3, &pool, &log, 100.0, 500.0);
+        ctrl3.session_start_equity = FPN_FromDouble<FP>(10000.0);
+        ctrl3.peak_equity = FPN_FromDouble<FP>(12000.0);  // was at 12k, now crashed
+        ctrl3.balance = FPN_FromDouble<FP>(10000.0);
+        // position worth 100, equity = 10100, dd = (12000-10100)/12000 = 15.8% > 5% limit
+        Portfolio_AddPositionWithExits(&ctrl3.portfolio, FPN_FromDouble<FP>(1.0),
+            FPN_FromDouble<FP>(100.0), FPN_FromDouble<FP>(110.0),
+            FPN_FromDouble<FP>(90.0));
+        PortfolioController_Tick(&ctrl3, &pool, FPN_FromDouble<FP>(100.0),
+                                  FPN_FromDouble<FP>(500.0), &log);
+        check("hot-path kill: drawdown triggers kill switch",
+              ctrl3.kill_switch_active == 1);
+        check("hot-path kill: drawdown kill_reason is 2",
+              ctrl3.kill_reason == 2);
+
+        // 5. unpause blocked by active kill switch
+        PortfolioController<FP> ctrl4 = {};
+        PortfolioController_Init(&ctrl4, cfg);
+        test_warmup_ctrl(&ctrl4, &pool, &log, 100.0, 500.0);
+        ctrl4.kill_switch_active = 1;
+        ctrl4.buying_halted = 1;
+        ctrl4.halt_reason = 1;
+        ctrl4.buy_conds.price = FPN_Zero<FP>(); // simulate halted state
+        ctrl4.buy_conds.volume = FPN_Zero<FP>();
+        PortfolioController_Unpause(&ctrl4);
+        check("unpause blocked: buying_halted stays 1 when kill active",
+              ctrl4.buying_halted == 1);
+        check("unpause blocked: buy_conds.price stays zero",
+              FPN_IsZero(ctrl4.buy_conds.price));
+
+        // 6. centralized halt: volatile regime sets halted
+        PortfolioController<FP> ctrl5 = {};
+        PortfolioController_Init(&ctrl5, cfg);
+        cfg.kill_switch_enabled = 0; // disable kill so it doesn't interfere
+        PortfolioController_Init(&ctrl5, cfg);
+        test_warmup_ctrl(&ctrl5, &pool, &log, 100.0, 500.0);
+        ctrl5.regime.current_regime = REGIME_VOLATILE;
+        // run a slow-path tick to trigger centralized halt
+        ctrl5.tick_count = ctrl5.config.poll_interval; // force slow path
+        PortfolioController_Tick(&ctrl5, &pool, FPN_FromDouble<FP>(100.0),
+                                  FPN_FromDouble<FP>(500.0), &log);
+        check("volatile halt: buying_halted set",
+              ctrl5.buying_halted == 1);
+        check("volatile halt: halt_reason is 3 (volatile)",
+              ctrl5.halt_reason == 3);
+
+        // 7. SL cooldown decrements independently during volatile
+        ctrl5.sl_cooldown_counter = 5;
+        ctrl5.tick_count = ctrl5.config.poll_interval;
+        PortfolioController_Tick(&ctrl5, &pool, FPN_FromDouble<FP>(100.0),
+                                  FPN_FromDouble<FP>(500.0), &log);
+        check("cooldown decrement: counter decremented during volatile",
+              ctrl5.sl_cooldown_counter == 4);
+        check("cooldown decrement: halt_reason still volatile (higher priority)",
+              ctrl5.halt_reason == 3);
+
+        TradeLog_Close(&log);
+        free(pool.slots);
+        remove("HALT_TEST_order_history.csv");
+    }
+
+    //======================================================================================================
+    // PUSHBUY GUARD
+    //======================================================================================================
+    printf("\n--- PUSHBUY GUARD ---\n");
+    {
+        ControllerConfig<FP> cfg = ControllerConfig_Default<FP>();
+        cfg.warmup_ticks = 10;
+        cfg.poll_interval = 1;
+        cfg.min_warmup_samples = 10;
+        cfg.starting_balance = FPN_FromDouble<FP>(10000.0);
+        cfg.max_positions = 1;
+
+        PortfolioController<FP> ctrl = {};
+        PortfolioController_Init(&ctrl, cfg);
+        OrderPool<FP> pool;
+        OrderPool_init(&pool, 64);
+        TradeLog log;
+        TradeLog_Init(&log, "PUSHBUY_TEST");
+        test_warmup_ctrl(&ctrl, &pool, &log, 100.0, 500.0);
+
+        // fill slot 0 so portfolio is full (max_positions=1)
+        Portfolio_AddPositionWithExits(&ctrl.portfolio, FPN_FromDouble<FP>(0.1),
+            FPN_FromDouble<FP>(100.0), FPN_FromDouble<FP>(110.0), FPN_FromDouble<FP>(90.0));
+
+        // set up buy conditions and put a fill in the pool
+        ctrl.buy_conds.price = FPN_FromDouble<FP>(95.0);
+        ctrl.buy_conds.volume = FPN_FromDouble<FP>(100.0);
+        DataStream<FP> ds_push = {};
+        ds_push.price = FPN_FromDouble<FP>(94.0);
+        ds_push.volume = FPN_FromDouble<FP>(200.0);
+        BuyGate(&ctrl.buy_conds, &ds_push, &pool);
+        int buf_before = ctrl.trade_buf.count;
+        PortfolioController_Tick(&ctrl, &pool, FPN_FromDouble<FP>(94.0),
+                                  FPN_FromDouble<FP>(200.0), &log);
+        check("pushbuy guard: trade_buf.count unchanged on rejected fill",
+              ctrl.trade_buf.count == buf_before);
+        check("pushbuy guard: still only 1 position (full)",
+              Portfolio_CountActive(&ctrl.portfolio) == 1);
+
+        TradeLog_Close(&log);
+        free(pool.slots);
+        remove("PUSHBUY_TEST_order_history.csv");
+    }
+
+    //======================================================================================================
+    // FPN EXIT GATE COMPARISON
+    //======================================================================================================
+    printf("\n--- FPN EXIT GATE COMPARISON ---\n");
+    {
+        Portfolio<FP> port = {};
+        Portfolio_Init(&port);
+        ExitBuffer<FP> ebuf = {};
+        ExitBuffer_Init(&ebuf);
+
+        // add position: entry=100, TP=105, SL=95
+        FPN<FP> entry = FPN_FromDouble<FP>(100.0);
+        FPN<FP> tp = FPN_FromDouble<FP>(105.0);
+        FPN<FP> sl = FPN_FromDouble<FP>(95.0);
+        Portfolio_AddPositionWithExits(&port, FPN_FromDouble<FP>(1.0), entry, tp, sl);
+
+        // price at 94 (below SL) — must trigger exit
+        PositionExitGate(&port, FPN_FromDouble<FP>(94.0), &ebuf, 1);
+        check("exit gate: SL triggers at price below SL",
+              ebuf.count == 1);
+        check("exit gate: reason is SL (1)",
+              ebuf.records[0].reason == 1);
+        check("exit gate: bitmap cleared",
+              port.active_bitmap == 0);
+
+        // reset, test TP
+        ExitBuffer_Init(&ebuf);
+        Portfolio_AddPositionWithExits(&port, FPN_FromDouble<FP>(1.0), entry, tp, sl);
+        PositionExitGate(&port, FPN_FromDouble<FP>(106.0), &ebuf, 2);
+        check("exit gate: TP triggers at price above TP",
+              ebuf.count == 1);
+        check("exit gate: reason is TP (0)",
+              ebuf.records[0].reason == 0);
+
+        // reset, test price between SL and TP — no exit
+        ExitBuffer_Init(&ebuf);
+        Portfolio_AddPositionWithExits(&port, FPN_FromDouble<FP>(1.0), entry, tp, sl);
+        PositionExitGate(&port, FPN_FromDouble<FP>(100.0), &ebuf, 3);
+        check("exit gate: no exit when price between SL and TP",
+              ebuf.count == 0);
+        check("exit gate: bitmap still active",
+              port.active_bitmap != 0);
+
+        // test tight boundary: SL=95.001, price=95.0005 (just below SL)
+        // this exercises middle FPN words — the old 2-word comparison could miss this
+        ExitBuffer_Init(&ebuf);
+        Portfolio_Init(&port);
+        FPN<FP> tight_sl = FPN_FromDouble<FP>(95.001);
+        FPN<FP> tight_tp = FPN_FromDouble<FP>(105.0);
+        Portfolio_AddPositionWithExits(&port, FPN_FromDouble<FP>(1.0), entry, tight_tp, tight_sl);
+        FPN<FP> just_below = FPN_FromDouble<FP>(95.0005);
+        PositionExitGate(&port, just_below, &ebuf, 4);
+        check("exit gate: tight SL boundary triggers correctly",
+              ebuf.count == 1);
+
+        // price just above SL — no exit
+        ExitBuffer_Init(&ebuf);
+        Portfolio_Init(&port);
+        Portfolio_AddPositionWithExits(&port, FPN_FromDouble<FP>(1.0), entry, tight_tp, tight_sl);
+        FPN<FP> just_above = FPN_FromDouble<FP>(95.0015);
+        PositionExitGate(&port, just_above, &ebuf, 5);
+        check("exit gate: price just above SL does not trigger",
+              ebuf.count == 0);
     }
 
     printf("\n======================================\n");

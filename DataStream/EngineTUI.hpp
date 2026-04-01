@@ -671,6 +671,8 @@ struct TUISnapshot {
     // risk
     double risk_amt, max_dd;
     int breaker_tripped;
+    int buying_halted;
+    int halt_reason;
     // regime
     int current_regime;   // REGIME_RANGING, REGIME_TRENDING, REGIME_VOLATILE
     int strategy_id;      // STRATEGY_MEAN_REVERSION or STRATEGY_MOMENTUM
@@ -687,6 +689,7 @@ struct TUISnapshot {
     double ema_price;      // EMA price for proactive gate (0 = disabled)
     double book_imbalance; // bid/ask imbalance [-1, +1] (0 = no depth data)
     double book_spread;    // bid-ask spread
+    double danger_score;   // danger gradient [0, 1] — 0=safe, 1=crash
     int current_session;   // 0=asian, 1=european, 2=us, 3=overnight (-1=disabled)
     double session_mult;   // current session gate multiplier
     int sl_cooldown;      // remaining slow-path cycles in post-SL cooldown
@@ -736,7 +739,7 @@ struct TUISnapshot {
       double pnl;
       uint32_t wins, losses, total;
     };
-    StrategyStatsSnap strat_stats[4];
+    StrategyStatsSnap strat_stats[5];
     // right panel: session stats + fill diagnostics
     double session_high, session_low;
     double tick_rate;
@@ -868,6 +871,8 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
     snap->risk_amt   = FPN_ToDouble(ctrl->config.risk_pct) * 100.0;
     snap->max_dd     = FPN_ToDouble(ctrl->config.max_drawdown_pct) * 100.0;
     snap->breaker_tripped = (snap->total_pnl < -(starting * FPN_ToDouble(ctrl->config.max_drawdown_pct)));
+    snap->buying_halted = ctrl->buying_halted;
+    snap->halt_reason = ctrl->halt_reason;
 
     // regime
     snap->current_regime = ctrl->regime.current_regime;
@@ -903,6 +908,7 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
     snap->ema_price = FPN_ToDouble(ctrl->ema_price);
     snap->book_imbalance = FPN_ToDouble(ctrl->book_imbalance);
     snap->book_spread = 0.0; // populated from depth thread if available
+    snap->danger_score = FPN_ToDouble(ctrl->danger_score);
     snap->current_session = ctrl->current_session;
     snap->session_mult = FPN_ToDouble(ctrl->session_mult);
     snap->sl_cooldown = (int)ctrl->sl_cooldown_counter;
@@ -923,7 +929,7 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
           (snap->signal_strength < min_signal) && !snap->state_warmup;
     }
     // per-strategy reward attribution
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
       snap->strat_stats[i].pnl   = FPN_ToDouble(ctrl->strategy_stats[i].realized_pnl);
       snap->strat_stats[i].wins  = ctrl->strategy_stats[i].wins;
       snap->strat_stats[i].losses = ctrl->strategy_stats[i].losses;
@@ -980,9 +986,10 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
     } else snap->expectancy = 0.0;
 
     // max drawdown
-    snap->max_drawdown = ctrl->max_drawdown;
-    snap->max_drawdown_pct = (ctrl->peak_equity > 0.0) ?
-        (ctrl->max_drawdown / ctrl->peak_equity) * 100.0 : 0.0;
+    snap->max_drawdown = FPN_ToDouble(ctrl->max_drawdown);
+    double pe = FPN_ToDouble(ctrl->peak_equity);
+    snap->max_drawdown_pct = (pe > 0.0) ?
+        (snap->max_drawdown / pe) * 100.0 : 0.0;
 
     // fee ratio: what % of gross wins go to fees
     snap->fee_ratio = (g_wins > 0.001) ?
@@ -1114,10 +1121,11 @@ static inline void TUI_Render_Snapshot(EngineTUI *tui, const TUISnapshot *s) {
            s->risk_amt, s->breaker_tripped ? C_BOLD C_RED : C_GREEN, s->breaker_tripped ? "TRIPPED" : "OK", s->max_dd); row++;
     {
         const char *strat_name = (s->strategy_id == STRATEGY_MOMENTUM) ? "MOMENTUM" : "MEAN REVERSION";
-        const char *regime_name = (s->current_regime == REGIME_TRENDING) ? "TRENDING" :
-                                  (s->current_regime == REGIME_VOLATILE) ? "VOLATILE" : "RANGING";
-        const char *regime_color = (s->current_regime == REGIME_TRENDING) ? C_GREEN :
-                                   (s->current_regime == REGIME_VOLATILE) ? C_RED : C_DIM;
+        int rk = s->current_regime;
+        if (rk < 0 || rk >= NUM_REGIMES) rk = 0;
+        const char *regime_name = REGIME_INFO[rk].full_name;
+        const char *regime_color = (rk == REGIME_TRENDING || rk == REGIME_MILD_TREND) ? C_GREEN :
+                                   (rk == REGIME_VOLATILE || rk == REGIME_TRENDING_DOWN) ? C_RED : C_DIM;
         printf(C_SAND "    strategy:   " C_FG "%s" C_RESET C_DIM " (%s)  |  " C_YELLOW "PAPER" C_RESET "\n",
                strat_name, s->stddev_mode ? "stddev" : "pct"); row++;
         printf(C_SAND "    regime:     %s%s" C_RESET C_DIM " (%.0fm)" C_RESET "\n",
