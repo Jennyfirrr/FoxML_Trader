@@ -11,10 +11,10 @@ Built from scratch as a learning project — no frameworks, no black boxes.
 ## Features
 
 - **Tick-level execution**: every market tick processed in <100ns on hot path
-- **Fixed-point arithmetic**: deterministic 4096-bit FPN — no floating-point rounding variance
+- **Fixed-point arithmetic**: deterministic 128-bit FPN — no floating-point rounding variance
 - **Branchless hot path**: mask-select patterns eliminate branch misprediction
 - **Regime detection**: EMA/SMA crossover with score-based classification (RANGING / TRENDING / VOLATILE)
-- **4 strategies**: Mean Reversion, Momentum, SimpleDip, ML (model-driven)
+- **5 strategies**: Mean Reversion, Momentum, SimpleDip, EMA Cross, ML (model-driven)
 - **ML inference harness**: XGBoost / LightGBM C API integration (~1-5us per prediction)
 - **Risk infrastructure**: sticky kill switch, vol-scaled sizing, no-trade band, per-strategy P&L attribution
 - **Native GUI**: Dear ImGui + implot (SDL2/OpenGL3) — dockable panels, candlestick charts, live settings editor
@@ -36,7 +36,7 @@ cp engine.cfg.example engine.cfg    # edit with your settings
 # run
 cd build && ./engine
 
-# run tests (166 assertions)
+# run tests (245 assertions)
 ./build/controller_test
 ```
 
@@ -99,7 +99,9 @@ The GUI settings panel exposes all ~68 config fields with hover tooltips.
 
 ## Risk Infrastructure
 
-- **Sticky kill switch**: daily loss or drawdown limit breach halts all buying until session reset or manual `k` key. Persists across crashes (snapshot v9).
+- **Sticky kill switch**: daily loss or drawdown limit breach halts all buying until session reset or manual `k` key. Persists across crashes (snapshot v10).
+- **Centralized state mutations**: `KillSwitch_Activate/Reset`, `Buying_Halt`, `RecordExit` — all safety-critical transitions go through single-site functions
+- **Cache-optimal struct layout**: hot-path fields packed into 4 cache lines (256 bytes), cold data pushed to end
 - **Vol-scaled sizing**: position quantity scales inversely with volatility (consistent risk per trade)
 - **No-trade band**: suppresses entries when signal strength < fee breakeven (prevents churn)
 - **Per-strategy P&L**: tracks wins/losses/P&L per strategy for comparison
@@ -113,7 +115,7 @@ ML_Headers/       - RollingStats, ModelInference (XGBoost/LightGBM), WelfordStat
 DataStream/       - BinanceCrypto (websocket), EngineTUI (snapshot), TUIAnsi (renderer)
 FixedPoint/       - FPN arbitrary-width fixed-point arithmetic library
 GUI/              - Dear ImGui panels (dashboard, chart, settings, trade history, log)
-tests/            - controller_test.cpp (166 assertions)
+tests/            - controller_test.cpp (245 assertions)
 ```
 
 ## Platform Support
@@ -126,7 +128,8 @@ tests/            - controller_test.cpp (166 assertions)
 
 | Flag | Description |
 |------|-------------|
-| `-DUSE_IMGUI_GUI=ON` | Build native GUI (requires SDL2 + OpenGL) |
+| `-DUSE_IMGUI_GUI=ON` | Build native GUI (requires SDL2 + OpenGL) — **default** |
+| `-DUSE_NATIVE_128=ON` | Use native `__uint128_t` FPN (faster comparisons) — **default** |
 | `-DUSE_XGBOOST=ON` | Link XGBoost C API for ML inference |
 | `-DUSE_LIGHTGBM=ON` | Link LightGBM C API for ML inference |
 | `-DLATENCY_PROFILING=ON` | Enable RDTSCP latency profiling |

@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.1 — Clean Code, Fast Cache <3
+
+- **centralized state mutations** — `KillSwitch_Activate/Reset`, `Buying_Halt`, `RecordExit` replace 14 scattered inline sites with single-site functions
+- **RecordExit fixes** — time-exit and session-close paths now properly track daily P&L, strategy attribution, Welford stats, and gross wins/losses (were missing before)
+- **cache-optimal struct layout** — PortfolioController hot fields packed into 4 cache lines (256 bytes), moved from offset 10,672 to offset 88. RollingStats computed outputs moved from offset 6,664 to offset 8.
+- **128-bit FPN default** — native `__uint128_t` now default build, 245 test assertions passing
+
+## v1.1.0 — Safety Audit <3
+
+- **5 P&L bugs fixed** — balance drift, fee double-counting, snapshot persistence
+- **safety invariants** — SL floor enforcement, FPN division guards, FPN-only accounting
+- **snapshot v10** — entry_time, session stats, kill switch state, strategy attribution
+- **245 assertions** — up from 166, covering all safety-critical paths
+- **p99 latency display** — all latency panels show percentiles
+
 ## v1.0.8 — Toggle Everything <3
 
 - **overlay toggles** — checkboxes in the chart header to show/hide: Ribbon, Sessions, H/L, Tag
