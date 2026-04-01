@@ -1,253 +1,148 @@
-# Tick Trader
+# FoxML Trader
 
-**Copyright (c) 2026 Jennifer Lewis. All rights reserved.**
+Tick-level crypto trading engine in C++. Branchless fixed-point arithmetic, bitmap-based portfolio management, regime detection with EMA/SMA crossover, and ML inference harness for XGBoost/LightGBM.
 
-This software is dual-licensed: [AGPL-3.0-or-later](LICENSE) or Commercial. If you use this software without complying with the AGPL (including the requirement to publish your source code for any network-accessible deployment) and without a commercial license, you are infringing copyright.
+Built from scratch as a learning project — no frameworks, no black boxes.
 
-**Personal use, learning, and paper trading are welcome and encouraged.** Commercial use or deployment for profit requires a commercial license — contact [jenn.lewis5789@gmail.com](mailto:jenn.lewis5789@gmail.com).
+![FoxML Trader — chart + dashboard](assets/gui-overview.png)
+![FoxML Trader — live trading](assets/gui-trading.png)
+![FoxML Trader — full dashboard](assets/gui-dashboard.png)
 
-**Unauthorized Use — Settlement Terms:** 10% of gross revenue from date of first unauthorized use + flat fee TBD. Full statutory damages under 17 U.S.C. § 504 (up to $150,000 per work for willful infringement). **Bounty:** 33% of net recovery for reports leading to successful settlement. Contact: [jenn.lewis5789@gmail.com](mailto:jenn.lewis5789@gmail.com)
+## Features
 
----
-
-Tick-level crypto trading engine in C++17. Branchless fixed-point arithmetic, bitmap-based portfolio management, regime-adaptive strategy switching with score-based market classification. Sub-microsecond hot path, multicore TUI dashboard, zero external dependencies.
-
-> **Paper trading by default.** Live trading via Binance REST API is supported (Binance US or global). Set `use_real_money=1` + `use_binance_us=1` in engine.cfg and add API keys to `secrets.cfg`. No API key needed for market data — the public websocket is always used for price feeds.
-
-> **WARNING: Live trading is experimental.** Use at your own risk. This software is provided as-is with no warranty. The authors are not responsible for any financial losses. Start with micro position sizes and never risk money you can't afford to lose.
-
-> **Note:** With `max_positions=1` (default), the engine sells your entire BTC balance on exit, eliminating dust from quantity rounding. Startup recovery also sweeps any orphaned BTC from prior sessions. With `max_positions > 1`, small dust may still accumulate — periodically convert via the Binance dashboard (Trade → Convert Small Assets).
-
-> **Note:** The engine only tracks positions it creates. If you manually buy or sell on the Binance app/website, the engine won't detect it — restart the engine to reconcile. Account sync is planned for a future release.
-
-[![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/ncp/payment/8M6XLK7M8569C) [![Discord](https://img.shields.io/badge/Discord-Community-5865F2.svg)](https://discord.gg/asSDcYwPz)
-
-> **Next goal:** If donations cover tick-level options data, we're going there next — BTC spot is too safe for my liking.
-
-### Standard Layout
-![Standard Layout](assets/tui-standard.png)
-
-### Charts Layout
-![Charts Layout](assets/tui-charts.png)
-
-## Requirements
-
-- **CPU:** x86-64 with L1 D-cache (any modern Intel/AMD — hot path fits in ~3KB)
-- **RAM:** 1GB minimum (engine uses ~50MB including rolling stats and TUI)
-- **OS:** Linux (kernel 4.x+, tested on Arch)
-- **Compiler:** g++ with C++17 support
-- **Libraries:** OpenSSL (libssl, libcrypto), pthreads
-- **Network:** internet connection for Binance websocket + REST API
-- **Optional:** `constant_tsc` CPU flag for accurate latency profiling (standard on all modern CPUs)
+- **Tick-level execution**: every market tick processed in <100ns on hot path
+- **Fixed-point arithmetic**: deterministic 4096-bit FPN — no floating-point rounding variance
+- **Branchless hot path**: mask-select patterns eliminate branch misprediction
+- **Regime detection**: EMA/SMA crossover with score-based classification (RANGING / TRENDING / VOLATILE)
+- **4 strategies**: Mean Reversion, Momentum, SimpleDip, ML (model-driven)
+- **ML inference harness**: XGBoost / LightGBM C API integration (~1-5us per prediction)
+- **Risk infrastructure**: sticky kill switch, vol-scaled sizing, no-trade band, per-strategy P&L attribution
+- **Native GUI**: Dear ImGui + implot (SDL2/OpenGL3) — dockable panels, candlestick charts, live settings editor
+- **ANSI TUI**: zero-dependency terminal dashboard with diff-based rendering
+- **Live trading**: Binance websocket (market data) + REST API (orders)
+- **Paper trading**: full simulation with configurable fees, slippage, and balance
 
 ## Quick Start
 
 ```bash
-cp engine.cfg.example engine.cfg   # create your config from template
-make                               # build (ANSI TUI, zero deps beyond OpenSSL)
-make run                           # build + connect to Binance, paper trade BTC
-make test                          # run 134 tests
+# clone and build (ANSI TUI, only needs OpenSSL)
+git clone https://github.com/Jennyfirrr/FoxML_Trader.git
+cd FoxML_Trader
+cmake -B build && cmake --build build
+
+# configure
+cp engine.cfg.example engine.cfg    # edit with your settings
+
+# run
+cd build && ./engine
+
+# run tests (166 assertions)
+./build/controller_test
 ```
 
-Requires: g++ (C++17), OpenSSL, CMake 3.14+. No other dependencies.
+### GUI Build (SDL2 + OpenGL3)
 
-## What This Does
+```bash
+# install deps (Arch: sdl2, Ubuntu: libsdl2-dev)
+cmake -B build_gui -DUSE_IMGUI_GUI=ON
+cmake --build build_gui
+cd build_gui && ./engine_gui
+```
 
-The engine connects to Binance's public websocket, receives real-time BTC/USDT trade data, and makes paper trading decisions on every tick:
+### ML Inference Build
 
-1. **Classify the market** — score-based regime detection (RANGING / TRENDING / VOLATILE) using 7 signals: multi-timeframe slope, R² consistency, trend acceleration, volume confirmation, volatility ratio
-2. **Pick a strategy** — mean reversion for ranging markets (buy dips), momentum for trending markets (buy breakouts), pause for volatile
-3. **Manage positions** — up to 16 concurrent positions with per-position TP/SL, trailing stops, adaptive entry spacing, volume spike detection
-4. **Control risk** — circuit breaker on max drawdown, exposure limits, post-SL cooldown to prevent catching falling knives
+```bash
+# XGBoost
+cmake -B build -DUSE_XGBOOST=ON && cmake --build build
+
+# LightGBM
+cmake -B build -DUSE_LIGHTGBM=ON && cmake --build build
+```
 
 ## Architecture
 
 ```
-HOT PATH (every tick, p50 ~1-2μs, p99 ~8μs, BuyGate min ~40ns):
-  BuyGate          branchless price+volume gate           (~40ns min)
-  PositionExitGate bitmap walk, per-position TP/SL        (~130ns/pos)
-  FillConsumption  sizing, spacing, risk checks            (~750ns avg)
+HOT PATH (every tick, <100ns):
+  BuyGate (branchless) -> OrderPool
+  PositionExitGate (branchless bitmap walk) -> ExitBuffer
 
-SLOW PATH (every 100 ticks):
-  RollingStats     128-tick + 512-tick least-squares regression
-  RegimeDetector   7-signal score → RANGING/TRENDING/VOLATILE
-  StrategyDispatch adapt parameters + generate buy signal
-  TradeLog         buffered CSV drain
-  Snapshot         binary state persistence (v7)
+SLOW PATH (every N ticks):
+  RollingStats -> RegimeDetector -> Strategy dispatch
+  ML inference (if enabled) -> model_score enrichment
+  Portfolio P&L -> adaptive gate adjustment
 ```
 
-All hot-path math uses arbitrary-width fixed-point arithmetic (`FPN<64>` = 4096-bit precision). No floating point on the critical path. Branchless patterns throughout: mask tricks with `-(uint64_t)condition`, word-level mask-select.
+## ML Inference Harness
 
-## Strategies
+The engine supports model-driven trading via XGBoost or LightGBM:
 
-### Mean Reversion (RANGING regime)
-- **Entry:** price dips below rolling average (stddev-scaled offset, P&L regression-adapted)
-- **Exit:** per-position TP/SL, trailing TP (SNR×R² gated), time-based exit
-- **Volume spikes:** 5x+ spike halves entry spacing for tighter clustering on high-conviction dips
+- **Mode A — Regime Enrichment**: model prediction feeds into `RegimeSignals.model_score`, improving regime classification for all strategies
+- **Mode B — ML Strategy**: `STRATEGY_ML` (id=3) uses model predictions directly for buy signal generation
 
-### Momentum (TRENDING regime)
-- **Entry:** price breaks above rolling average + stddev offset
-- **Exit:** adaptive TP/SL — R²-scaled multipliers (high R² widens TP), ROR acceleration bonus (+20%)
-- **Adaptation:** P&L regression adjusts breakout threshold
+Models are trained offline (Python), engine does inference only. Feature packing maps RegimeSignals + RollingStats fields to a float vector matching the training pipeline.
 
-### Regime Detection
-7 input signals feed a weighted scoring system with hysteresis:
-
-| Signal | Source | What it measures |
-|--------|--------|-----------------|
-| Short slope | 128-tick regression | Recent price direction |
-| Long slope | 512-tick regression | Broader trend |
-| Short R² | 128-tick regression | Trend consistency |
-| ROR slope | Slope-of-slopes | Trend acceleration |
-| Volume slope | 128-tick regression | Volume trend |
-| Vol ratio | Short/long variance | Volatility spike |
-| Volume confirmation | Slope + volume | Compound signal |
-
-Trending needs 2/5 signals. Volatile needs 2/2. Hysteresis prevents rapid switching.
-
-### Risk Controls
-- **Post-SL cooldown** — pauses buying for N cycles after stop loss
-- **Circuit breaker** — halts trading if P&L exceeds max drawdown
-- **Exposure limit** — caps deployed capital as % of balance
-- **Entry spacing** — prevents position clustering at same price
-- **Volume spike spacing** — relaxes spacing on high-conviction volume surges
-- **Fill rejection diagnostics** — tracks why fills are rejected (spacing, balance, exposure, breaker)
-
-## TUI
-
-Zero-dependency ANSI terminal dashboard with warm-forest color palette (truecolor). Engine runs on core 0, TUI renders on core 1 from a double-buffered snapshot (zero engine contention). Diff-based rendering — unchanged content is never touched.
-
-Features:
-- 3 layouts: Standard, Charts, Compact (cycle with `l`)
-- Regime signals: R² bars, vol_ratio, ror_slope with directional arrows
-- Sparkline charts: price, P&L (per-bar green/red), volume (▁▂▃▄▅▆▇█)
-- Adaptive position list: expanded (≤4 positions) or compact (≥5)
-- Fill rejection diagnostics, session high/low, trading blocked indicator
-- Auto-resizes to terminal dimensions
-
-| Key | Action |
-|-----|--------|
-| `q` | Quit (saves positions to snapshot) |
-| `p` | Pause/unpause buying |
-| `r` | Hot-reload engine.cfg |
-| `s` | Cycle regime for testing |
-| `l` | Cycle layout |
-
-## Build
-
-```bash
-make              # ANSI TUI (default, no library deps)
-make run          # build + run
-make test         # run 149 tests
-make ftxui        # FTXUI TUI (auto-fetched)
-make notcurses    # notcurses TUI (requires system lib)
-make profile      # with RDTSCP latency profiling
-make clean        # remove build directory
+```cfg
+ml_backend=1                    # 1=xgboost, 2=lightgbm
+ml_model_path=models/buy.xgb
+ml_buy_threshold=0.60           # prediction > 0.6 = buy signal
 ```
 
-Or with CMake directly:
-
-```bash
-cmake -B build && cmake --build build                       # ANSI TUI
-cmake -B build -DUSE_FTXUI=ON && cmake --build build        # FTXUI
-cmake -B build -DUSE_NOTCURSES=ON && cmake --build build    # notcurses
-```
+> **Note**: ML harness is wired and compiles clean, but is untested with real models. Inference paths are no-ops when `ml_backend=0` (default).
 
 ## Configuration
 
-Copy `engine.cfg.example` to `engine.cfg` and edit. All parameters are documented in the file. Hot-reloadable with `r` in the TUI (except symbol, warmup_ticks).
+Copy `engine.cfg.example` to `engine.cfg` and edit. All parameters are hot-reloadable — press `r` in the TUI or edit the file while running.
 
-Key parameters:
-- `take_profit_pct` / `stop_loss_pct` — base TP/SL as percentage
-- `momentum_tp_mult` / `momentum_sl_mult` — stddev multipliers for momentum strategy
-- `spike_threshold` — volume spike ratio to trigger spacing relaxation
-- `slippage_pct` — simulated execution slippage (%, 0 = disabled)
-- `sl_cooldown_cycles` — slow-path cycles to pause after stop loss
-- `min_warmup_samples` — slow-path samples required before trading starts
-- `regime_r2_threshold` — R² required for TRENDING classification
+Key sections: Trading, Entry Filters, Risk Management, Kill Switch, Vol Sizing, No-Trade Band, Regime Detection, ML Inference, Session Filters.
 
-See `DOCS/CONFIGURATION.md` for the full reference.
+The GUI settings panel exposes all ~68 config fields with hover tooltips.
+
+## Risk Infrastructure
+
+- **Sticky kill switch**: daily loss or drawdown limit breach halts all buying until session reset or manual `k` key. Persists across crashes (snapshot v9).
+- **Vol-scaled sizing**: position quantity scales inversely with volatility (consistent risk per trade)
+- **No-trade band**: suppresses entries when signal strength < fee breakeven (prevents churn)
+- **Per-strategy P&L**: tracks wins/losses/P&L per strategy for comparison
 
 ## Project Structure
 
 ```
-CoreFrameworks/          Portfolio, OrderGates, PortfolioController, Config
-Strategies/              MeanReversion, Momentum, RegimeDetector, StrategyInterface
-DataStream/              BinanceCrypto (websocket), TUI renderers, TradeLog
-FixedPoint/              Arbitrary-width fixed-point arithmetic library
-ML_Headers/              RollingStats, LinearRegression, ROR regressor
-MemHeaders/              PoolAllocator, BuddyAllocator
-tests/                   149 assertions across 31 test functions
-DOCS/                    Architecture, configuration, performance, changelogs
+CoreFrameworks/   - OrderGates, Portfolio (bitmap), PortfolioController (feedback loop)
+Strategies/       - RegimeDetector, MeanReversion, Momentum, SimpleDip, MLStrategy
+ML_Headers/       - RollingStats, ModelInference (XGBoost/LightGBM), WelfordStats
+DataStream/       - BinanceCrypto (websocket), EngineTUI (snapshot), TUIAnsi (renderer)
+FixedPoint/       - FPN arbitrary-width fixed-point arithmetic library
+GUI/              - Dear ImGui panels (dashboard, chart, settings, trade history, log)
+tests/            - controller_test.cpp (166 assertions)
 ```
 
-## Adding a Strategy
+## Platform Support
 
-1. Create `Strategies/NewStrategy.hpp` — implement Init, Adapt, BuySignal, ExitAdjust
-2. Add `STRATEGY_NEW = 2` to `StrategyInterface.hpp`
-3. Add case to dispatch switch in `PortfolioController.hpp`
-4. Add config fields + defaults to `ControllerConfig.hpp`
-5. Map regime → strategy in `Regime_ToStrategy`
+- **Linux**: fully tested (Arch, Ubuntu)
+- **Windows**: use WSL2 (native Windows not supported)
+- **macOS**: should work, untested — install deps via Homebrew
 
-See `DOCS/CONTRIBUTING.md` for the full guide.
+## Build Options
 
-## Latency Tuning
+| Flag | Description |
+|------|-------------|
+| `-DUSE_IMGUI_GUI=ON` | Build native GUI (requires SDL2 + OpenGL) |
+| `-DUSE_XGBOOST=ON` | Link XGBoost C API for ML inference |
+| `-DUSE_LIGHTGBM=ON` | Link LightGBM C API for ML inference |
+| `-DLATENCY_PROFILING=ON` | Enable RDTSCP latency profiling |
+| `-DBUSY_POLL=ON` | Spin-poll instead of sleeping (lower latency, higher CPU) |
 
-The hot path (BuyGate → ExitGate → PortfolioController_Tick) achieves p50 ~1-2μs, p99 ~8μs:
+## TUI Controls
 
-| Component | Typical | What it does |
-|-----------|---------|-------------|
-| BuyGate | ~40ns | Branchless price+volume compare, pool write |
-| ExitGate | ~80ns/pos | Bitmap walk, TP/SL compare per position |
-| PCTick | ~200ns | Fill consumption, bitmap ops |
-
-In practice, avg rises to 1-2μs and p95 to 4-8μs from cache pollution and scheduler interrupts. To get consistent sub-500ns:
-
-### Core Isolation (Linux)
-
-Add to kernel boot parameters (`/etc/kernel/cmdline` or `GRUB_CMDLINE_LINUX`):
-
-```
-isolcpus=3 nohz_full=3 rcu_nocbs=3
-```
-
-- `isolcpus=3` — removes core 3 from general scheduler (only pinned tasks run on it)
-- `nohz_full=3` — disables timer tick on core 3 (no 250Hz scheduler interrupts)
-- `rcu_nocbs=3` — moves kernel RCU callbacks off core 3
-
-Reboot to apply. The engine already pins itself to core 3 and TUI to core 2 (`pthread_setaffinity_np` in main.cpp). With 8+ cores, dedicating 1 core leaves plenty for the OS.
-
-### Build Options
-
-```bash
-cmake -B build -DBUSY_POLL=ON        # spin-poll instead of poll() — keeps icache permanently warm
-cmake -B build -DLATENCY_PROFILING=ON # RDTSCP instrumentation — shows per-component breakdown
-cmake -B build -DLATENCY_LITE=ON      # lighter profiling (hot path only, skip component breakdown)
-cmake -B build -DLATENCY_BENCH=ON     # TUI disabled, clean measurement
-cmake -B build -DUSE_NATIVE_128=ON    # native 128-bit multiply (avoids __int128 emulation)
-```
-
-### Arch Linux (systemd-boot)
-
-```bash
-# Edit /etc/kernel/cmdline, add: isolcpus=3 nohz_full=3 rcu_nocbs=3
-sudo reinstall-kernels   # or: sudo bootctl update
-reboot
-```
-
-### Verify
-
-```bash
-cat /sys/devices/system/cpu/isolated   # should show: 3
-taskset -p $(pgrep engine)             # should show affinity mask: 8 (core 3)
-```
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `p` | Pause/unpause buying |
+| `r` | Hot-reload config from engine.cfg |
+| `s` | Cycle regime (manual override) |
+| `k` | Reset kill switch |
+| `l` | Cycle TUI layout |
 
 ## License
 
-AGPL-3.0-or-later or Commercial. See top of this file for full terms.
-
----
-
-<a href="https://www.paypal.com/ncp/payment/8M6XLK7M8569C">
-  <img src="assets/donate-qr.png" alt="Support development" width="150">
-</a>
+MIT — see [LICENSE](LICENSE)
