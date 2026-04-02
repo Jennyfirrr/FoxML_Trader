@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jennifer Lewis. All rights reserved.
-// Licensed under the MIT License. See LICENSE for details.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 // See LICENSE file in the project root for full license text.
 
 //======================================================================================================
@@ -31,6 +31,7 @@
 #include "GUI/GuiThread.hpp"
 #endif
 
+#include "Licensing.hpp"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -60,7 +61,17 @@ static inline void engine_force_close_all(PortfolioController<FP> *ctrl, TradeLo
         double qty_d     = FPN_ToDouble(pos->quantity);
         double delta_pct = (entry_d != 0.0) ? ((exit_d - entry_d) / entry_d) * 100.0 : 0.0;
 
-        RecordExit(ctrl, idx, last_price, ctrl->total_ticks, 3); // reason 3 = SESSION_CLOSE
+        // build ExitRecord from live position data (slot is valid — we're iterating active bitmap)
+        ExitRecord<FP> close_rec;
+        close_rec.position_index = idx;
+        close_rec.exit_price = last_price;
+        close_rec.tick = ctrl->total_ticks;
+        close_rec.reason = 3; // SESSION_CLOSE
+        close_rec.entry_price = pos->entry_price;
+        close_rec.quantity = pos->quantity;
+        close_rec.entry_fee = pos->entry_fee;
+        close_rec.pair_index = pos->pair_index;
+        RecordExit(ctrl, &close_rec);
 
         // direct CSV write — trade_buf will be cleared on reinit, this persists
         { TradeLogRecord r = {};
@@ -90,7 +101,7 @@ static inline void engine_force_close_all(PortfolioController<FP> *ctrl, TradeLo
 //======================================================================================================
 int main(int argc, char *argv[]) {
     fprintf(stderr, "Tick Trader — Copyright (c) 2026 Jennifer Lewis. All rights reserved.\n");
-    fprintf(stderr, "Licensed under the MIT License.\n\n");
+    fprintf(stderr, "Licensed under AGPL-3.0-or-later. Commercial license: jenn.lewis5789@gmail.com\n\n");
 
     const char *cfg_path = (argc > 1) ? argv[1] : "engine.cfg";
 
@@ -119,6 +130,19 @@ int main(int argc, char *argv[]) {
             setvbuf(stderr, NULL, _IOLBF, 0); // line-buffered so tail -f works
         }
     }
+
+    //==================================================================================================
+    // license check — before connecting to exchange
+    //==================================================================================================
+#ifndef LICENSE_BYPASS
+    LicenseInfo license;
+    if (!License_Validate(&license)) {
+        fprintf(stderr, "\n[ENGINE] license validation failed.\n");
+        fprintf(stderr, "[ENGINE] place your license key in ~/.foxml/license.key\n");
+        fprintf(stderr, "[ENGINE] get a key at https://foxml.dev\n\n");
+        return 1;
+    }
+#endif
 
     //==================================================================================================
     // init stream

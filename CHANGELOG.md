@@ -2,12 +2,14 @@
 
 ## v1.2.1 — Don't Lose Money on Wins <3
 
-Three safety bugs fixed. All related to positions exiting through the hot-path exit gate.
+Four safety bugs fixed. All related to positions exiting through the hot-path exit gate.
 
-- **kill switch false trigger fixed** — exit gate clears the position bitmap instantly, but balance isn't credited until the slow-path drain. Between those events equity looked like it crashed. Now uses exact pending proceeds (exit price, fees, slippage) instead of approximate market price
-- **win/loss classification by P&L** — a TP exit where fees ate the profit was counted as a "win". Now wins require positive P&L, not just TP reason. No more 100% win rate on losing trades
-- **fee floor after regime tightening** — regime transitions (TRENDING/MILD_TREND → RANGING, → DOWNTREND) tighten TP with FPN_Min but never re-checked the fee floor. When volatility drops after fill, TP could end up $5 above entry with $6 in round-trip fees. Now enforced after every TP tightening
-- **271 assertions** — 12 new tests covering all three bugs
+- **exit record slot reuse fix** — the big one. ExitRecord only stored a slot index — DrainExits read position data from the slot, but the slot could be reused by a new fill before drain ran. With max_positions=1 this caused phantom $900 drawdowns on $20 real losses, false kill switch triggers, and double sells. ExitRecord now snapshots entry_price, quantity, entry_fee at exit time. Zero slot reads after bitmap clear
+- **kill switch false trigger fixed** — exact pending proceeds (exit price, fees, slippage) instead of approximate market price
+- **win/loss classification by P&L** — TP exits where fees ate the profit now count as losses, not wins
+- **fee floor after regime tightening** — regime transitions can't push TP below fee breakeven anymore
+- **danger meter removed** — the progress bar was ugly
+- **279 assertions** — 20 new tests including slot reuse regression
 
 ## v1.2.0 — Dashboard Polish <3
 
