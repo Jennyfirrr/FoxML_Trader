@@ -4,6 +4,10 @@ Tick-level crypto trading engine in C++. Branchless fixed-point arithmetic, bitm
 
 Built from scratch as a learning project — no frameworks, no black boxes.
 
+> **Note:** This project is actively developed using paper trading. Most features and updates are untested on live exchanges. Use at your own risk — this is a learning/research tool, not financial advice.
+>
+> **Roadmap:** Paper trading is the current focus — once bug-free, live exchange testing follows.
+
 ![FoxML Trader — chart + dashboard](assets/gui-overview.png)
 ![FoxML Trader — live trading](assets/gui-trading.png)
 ![FoxML Trader — full dashboard](assets/gui-dashboard.png)

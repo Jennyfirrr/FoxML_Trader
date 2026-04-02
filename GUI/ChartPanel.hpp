@@ -272,31 +272,25 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
             dl->AddRectFilled(ImVec2(cx - hw, top), ImVec2(cx + hw, bot), bc);
         }
 
-        // trade markers — only show if price falls within a candle's high-low range
-        // prevents old trades from snapping to unrelated candles as ghosts
-        for (int mi = 0; mi < trades->marker_count; mi++) {
-            const TradeMarker *m = &trades->markers[mi];
+        // entry markers — drawn from live position data (not CSV), keyed by entry_time
+        // only active positions get markers, they disappear on close — no persistence/drift
+        for (int pi = 0; pi < 16; pi++) {
+            const TUIPositionSnap *ps = &snap->positions[pi];
+            if (ps->idx < 0 || ps->entry_time == 0) continue;
+            double et = (double)ps->entry_time;
+            // find candle containing this entry time
             int best_i = -1;
             for (int i = vc - 1; i >= 0; i--) {
-                // trade price must be within this candle's wick range
-                // take most recent match (scan right-to-left)
-                if (m->price >= cs->lows[i] && m->price <= cs->highs[i]) {
+                if (cs->times_sec[i] <= et && (i == vc - 1 || cs->times_sec[i + 1] > et)) {
                     best_i = i;
                     break;
                 }
             }
             if (best_i < 0) continue;
-            ImVec2 pos = ImPlot::PlotToPixels(cs->xs[best_i], m->price);
-            float sz = 6.0f;
-            if (m->is_sell) {
-                ImU32 col = ImGui::GetColorU32(m->is_tp ? FoxmlColors::green_b : FoxmlColors::red_b);
-                dl->AddTriangleFilled(ImVec2(pos.x-sz, pos.y-sz), ImVec2(pos.x+sz, pos.y-sz),
-                                      ImVec2(pos.x, pos.y+sz), col);
-            } else {
-                ImU32 col = ImGui::GetColorU32(FoxmlColors::green_b);
-                dl->AddTriangleFilled(ImVec2(pos.x, pos.y-sz), ImVec2(pos.x-sz, pos.y+sz),
-                                      ImVec2(pos.x+sz, pos.y+sz), col);
-            }
+            ImVec2 pos = ImPlot::PlotToPixels(cs->xs[best_i], ps->entry);
+            ImU32 col = ImGui::GetColorU32(ImVec4(FoxmlColors::green_b.x, FoxmlColors::green_b.y,
+                                                    FoxmlColors::green_b.z, 0.8f));
+            dl->AddCircleFilled(pos, 3.5f, col);
         }
         ImPlot::PopPlotClipRect();
 
@@ -890,6 +884,66 @@ static inline void GUI_VolumeChart(const ChartState *cs, const TUISnapshot *snap
         ImPlot::EndPlot();
     }
     ImPlot::PopStyleColor(2);  // PlotBg + AxisGrid
+    ImGui::End();
+}
+
+//==========================================================================
+// LIVE P&L — streaming chart from pnl_history ring buffer
+//==========================================================================
+static inline void GUI_LivePnLChart(const TUISnapshot *s) {
+    ImGui::Begin("Live P&L");
+    if (s->graph_count < 2) {
+        ImGui::TextColored(FoxmlColors::comment, "collecting data...");
+        ImGui::End();
+        return;
+    }
+
+    // unroll ring buffer into linear array
+    int n = s->graph_count;
+    int len = TUISnapshot::GRAPH_LEN;
+    double xs[TUISnapshot::GRAPH_LEN], ys[TUISnapshot::GRAPH_LEN], zeros[TUISnapshot::GRAPH_LEN] = {};
+    for (int i = 0; i < n; i++) {
+        int ri = (s->graph_head - n + i + len) % len;
+        xs[i] = (double)i;
+        ys[i] = s->pnl_history[ri];
+    }
+
+    ImPlot::PushStyleColor(ImPlotCol_PlotBg, FoxmlColors::bg_dark);
+    if (ImPlot::BeginPlot("##live_pnl", ImVec2(-1, -1),
+                           ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText)) {
+        ImPlot::SetupAxes(NULL, "P&L",
+                          ImPlotAxisFlags_NoLabel | ImPlotAxisFlags_NoTickLabels,
+                          ImPlotAxisFlags_Opposite);
+        ImPlot::SetupAxisLimits(ImAxis_X1, -0.5, n - 0.5, ImPlotCond_Always);
+
+        double ymin = 0, ymax = 0;
+        for (int i = 0; i < n; i++) {
+            if (ys[i] < ymin) ymin = ys[i];
+            if (ys[i] > ymax) ymax = ys[i];
+        }
+        double yrange = ymax - ymin;
+        if (yrange < 0.01) yrange = 1.0;
+        double ypad = yrange * 0.15;
+        ImPlot::SetupAxisLimits(ImAxis_Y1, ymin - ypad, ymax + ypad, ImPlotCond_Always);
+        ImPlot::SetupAxisFormat(ImAxis_Y1, "$%+.2f");
+
+        // zero line
+        double zy[2] = {0, 0}, zx[2] = {-0.5, (double)(n - 0.5)};
+        ImPlotSpec zs; zs.LineColor = FoxmlColors::surface; zs.LineWeight = 1.0f;
+        ImPlot::PlotLine("##zero", zx, zy, 2, zs);
+
+        // P&L line
+        ImPlotSpec ls; ls.LineColor = FoxmlColors::primary; ls.LineWeight = 1.5f;
+        ImPlot::PlotLine("P&L", xs, ys, n, ls);
+
+        // shaded fill — green above zero, red below
+        ImPlotSpec gs; gs.FillColor = FoxmlColors::green; gs.FillAlpha = 0.12f;
+        gs.LineColor = {0,0,0,0};
+        ImPlot::PlotShaded("##fill", xs, ys, zeros, n, gs);
+
+        ImPlot::EndPlot();
+    }
+    ImPlot::PopStyleColor();
     ImGui::End();
 }
 

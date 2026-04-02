@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.2.0 — Dashboard Polish <3
+
+- **GUI overhaul** — merged 10 panels → 7 (Account, Market), cleaner layout, zero duplication
+- **position progress indicator** — shows where price sits between SL and TP per position
+- **danger meter** — crash protection gradient bar in Buy Gate panel
+- **live P&L chart** — streaming equity chart from ring buffer, docked alongside Volume
+- **13 gate reason codes** — PAUSED (no_signal), GATE OFF (cooldown), etc. across status bar, buy gate, and banner
+- **structured logging** — [TRADE], [REGIME], [GATE], [SESSION] events in engine log
+- **logging/ directory** — all runtime files (snapshots, CSVs, logs) in one place. `rm -rf logging/*` for clean start
+- **live entry markers** — green dot on chart at exact entry candle, disappears on close
+- **kill switch diagnostics** — full debug dump on trigger, balance drift false positive fix
+- **GUI kill reset** — K key now works in ImGui GUI (was TUI-only)
+- **259 assertions** — balance drift tests, kill switch regression tests
+
 ## v1.1.1 — Clean Code, Fast Cache <3
 
 - **centralized state mutations** — `KillSwitch_Activate/Reset`, `Buying_Halt`, `RecordExit` replace 14 scattered inline sites with single-site functions

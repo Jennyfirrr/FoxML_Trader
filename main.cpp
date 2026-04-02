@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jennifer Lewis. All rights reserved.
-// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// Licensed under the MIT License. See LICENSE for details.
 // See LICENSE file in the project root for full license text.
 
 //======================================================================================================
@@ -31,13 +31,13 @@
 #include "GUI/GuiThread.hpp"
 #endif
 
-#include "Licensing.hpp"
 #include <stdio.h>
 #include <stdlib.h>
 
 #ifdef LATENCY_PROFILING
 #include <x86intrin.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #endif
 
 constexpr unsigned FP = 64;
@@ -90,7 +90,7 @@ static inline void engine_force_close_all(PortfolioController<FP> *ctrl, TradeLo
 //======================================================================================================
 int main(int argc, char *argv[]) {
     fprintf(stderr, "Tick Trader — Copyright (c) 2026 Jennifer Lewis. All rights reserved.\n");
-    fprintf(stderr, "Licensed under AGPL-3.0-or-later. Commercial license: jenn.lewis5789@gmail.com\n\n");
+    fprintf(stderr, "Licensed under the MIT License.\n\n");
 
     const char *cfg_path = (argc > 1) ? argv[1] : "engine.cfg";
 
@@ -100,34 +100,25 @@ int main(int argc, char *argv[]) {
     BinanceConfig bcfg       = BinanceConfig_Load(cfg_path);
     ControllerConfig<FP> ccfg = ControllerConfig_Load<FP>(cfg_path);
 
+    // create logging directory — all runtime files go here (rm -rf logging/* for clean start)
+    mkdir("logging", 0755); // silently succeeds if already exists
+
     // auto-redirect stderr to log file — always when log_file is set
     // rotates on startup: engine.log → engine.log.1 (keeps one previous session)
     // in TUI mode: diagnostics go to file instead of being eaten by screen redraws
     // in headless mode: no manual 2>engine.log needed
     if (bcfg.log_file[0]) {
-        char prev[272];
-        snprintf(prev, sizeof(prev), "%s.1", bcfg.log_file);
-        rename(bcfg.log_file, prev); // silently fails if no existing log
-        FILE *lf = freopen(bcfg.log_file, "w", stderr);
+        char log_path[300], prev[304];
+        snprintf(log_path, sizeof(log_path), "logging/%s", bcfg.log_file);
+        snprintf(prev, sizeof(prev), "%s.1", log_path);
+        rename(log_path, prev); // silently fails if no existing log
+        FILE *lf = freopen(log_path, "w", stderr);
         if (!lf) {
             perror("freopen log_file");
         } else {
             setvbuf(stderr, NULL, _IOLBF, 0); // line-buffered so tail -f works
         }
     }
-
-    //==================================================================================================
-    // license check — before connecting to exchange
-    //==================================================================================================
-#ifndef LICENSE_BYPASS
-    LicenseInfo license;
-    if (!License_Validate(&license)) {
-        fprintf(stderr, "\n[ENGINE] license validation failed.\n");
-        fprintf(stderr, "[ENGINE] place your license key in ~/.foxml/license.key\n");
-        fprintf(stderr, "[ENGINE] get a key at https://foxml.dev\n\n");
-        return 1;
-    }
-#endif
 
     //==================================================================================================
     // init stream
@@ -146,7 +137,7 @@ int main(int argc, char *argv[]) {
     PortfolioController_Init(&ctrl, ccfg);
 
     // try to load snapshot from previous session
-    const char *snapshot_path = ccfg.use_real_money ? "portfolio.live.snapshot" : "portfolio.paper.snapshot";
+    const char *snapshot_path = ccfg.use_real_money ? "logging/portfolio.live.snapshot" : "logging/portfolio.paper.snapshot";
     if (PortfolioController_LoadSnapshot(&ctrl, snapshot_path)) {
         int pos_count = Portfolio_CountActive(&ctrl.portfolio);
         fprintf(stderr, "[ENGINE] resumed %d positions from snapshot\n", pos_count);
@@ -168,7 +159,7 @@ int main(int argc, char *argv[]) {
     // metrics log — diagnostics for verifying regime switching, strategy behavior
     MetricsLog metrics;
     char metrics_path[128];
-    snprintf(metrics_path, sizeof(metrics_path), "%s_metrics.csv", bcfg.symbol);
+    snprintf(metrics_path, sizeof(metrics_path), "logging/%s_metrics.csv", bcfg.symbol);
     MetricsLog_Init(&metrics, metrics_path);
 
     //==================================================================================================

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jennifer Lewis. All rights reserved.
-// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// Licensed under the MIT License. See LICENSE for details.
 // See LICENSE file in the project root for full license text.
 
 //======================================================================================================
@@ -462,7 +462,7 @@ static inline void TUI_Render(EngineTUI *tui, const PortfolioController<F> *ctrl
     printf(C_SAND "    avg win: " C_GREEN "$%.4f" C_RESET
            C_SAND "  avg loss: " C_RED "$%.4f" C_RESET "\n",
            avg_win, avg_loss); row++;
-    printf(C_DIM "    log: btcusdt_order_history.csv" C_RESET "\n"); row++;
+    printf(C_DIM "    log: logging/btcusdt_order_history.csv" C_RESET "\n"); row++;
     printf(C_SAND "  ================================================" C_RESET "\n"); row++;
 #ifdef LATENCY_PROFILING
     printf(C_SURF "  ----------------------------------------------------------------" C_RESET "\n"); row++;
@@ -623,6 +623,7 @@ struct TUIPositionSnap {
     int is_trailing, above_orig_tp;
     uint64_t ticks_held;
     double hold_minutes;  // wall clock hold duration
+    time_t entry_time;    // wall clock entry timestamp (for chart markers)
 };
 
 struct TUISnapshot {
@@ -672,6 +673,7 @@ struct TUISnapshot {
     int breaker_tripped;
     int buying_halted;
     int halt_reason;
+    int gate_reason;            // GATE_REASON_* — specific reason gate is off
     // regime
     int current_regime;   // REGIME_RANGING, REGIME_TRENDING, REGIME_VOLATILE
     int strategy_id;      // STRATEGY_MEAN_REVERSION or STRATEGY_MOMENTUM
@@ -846,6 +848,7 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
         ps->ticks_held   = ctrl->total_ticks - ctrl->entry_ticks[idx];
         ps->hold_minutes = (ctrl->entry_time[idx] > 0)
             ? difftime(time(NULL), ctrl->entry_time[idx]) / 60.0 : 0.0;
+        ps->entry_time = ctrl->entry_time[idx];
         snap->total_value += ps->value;
         snap->total_qty   += ps->qty;
         active &= active - 1;
@@ -872,6 +875,7 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
     snap->breaker_tripped = (snap->total_pnl < -(starting * FPN_ToDouble(ctrl->config.max_drawdown_pct)));
     snap->buying_halted = ctrl->buying_halted;
     snap->halt_reason = ctrl->halt_reason;
+    snap->gate_reason = ctrl->gate_reason;
 
     // regime
     snap->current_regime = ctrl->regime.current_regime;
@@ -1161,7 +1165,7 @@ static inline void TUI_Render_Snapshot(EngineTUI *tui, const TUISnapshot *s) {
            (s->profit_factor >= 1.0) ? C_GREEN : (total_exits > 0 ? C_RED : C_DIM), s->profit_factor); row++;
     printf(C_SAND "    avg win: " C_GREEN "$%.4f" C_RESET C_SAND "  avg loss: " C_RED "$%.4f" C_RESET "\n",
            s->avg_win, s->avg_loss); row++;
-    printf(C_DIM "    log: btcusdt_order_history.csv" C_RESET "\n"); row++;
+    printf(C_DIM "    log: logging/btcusdt_order_history.csv" C_RESET "\n"); row++;
     printf(C_SAND "  ================================================" C_RESET "\n"); row++;
 
 #ifdef LATENCY_PROFILING

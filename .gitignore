@@ -2,16 +2,10 @@ build/
 build_gui/
 build_latency/
 vendor/
+logging/
+paper_runs/
 *.o
 *.d
 plans/
 .claude/
 .chart-venv/
-
-# private configs — never commit actual trading params or keys
-# use engine.cfg.example as reference
-engine.cfg
-CoreFrameworks/controller.cfg
-*.env
-*.key
-*.pem

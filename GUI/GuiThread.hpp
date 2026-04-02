@@ -213,6 +213,7 @@ static inline void Gui_SetupDefaultLayout(ImGuiID dockspace_id) {
     ImGui::DockBuilderSplitNode(dock_left, ImGuiDir_Up, 0.70f, &dock_left_top, &dock_left_bottom);
     ImGui::DockBuilderDockWindow("Price Chart", dock_left_top);
     ImGui::DockBuilderDockWindow("Volume", dock_left_bottom);
+    ImGui::DockBuilderDockWindow("Live P&L", dock_left_bottom);
     ImGui::DockBuilderDockWindow("Equity Curve", dock_left_bottom);
 
     // stack all dashboard panels into right side
@@ -223,13 +224,9 @@ static inline void Gui_SetupDefaultLayout(ImGuiID dockspace_id) {
     // top-right: main dashboard panels (tabbed/stacked)
     ImGui::DockBuilderDockWindow("Header", dock_right_top);
     ImGui::DockBuilderDockWindow("Top Bar", dock_right_top);
-    ImGui::DockBuilderDockWindow("Market Structure", dock_right_top);
-    ImGui::DockBuilderDockWindow("Regime Signals", dock_right_top);
+    ImGui::DockBuilderDockWindow("Market", dock_right_top);
     ImGui::DockBuilderDockWindow("Buy Gate", dock_right_top);
-    ImGui::DockBuilderDockWindow("Portfolio", dock_right_top);
-    ImGui::DockBuilderDockWindow("P&L", dock_right_top);
-    ImGui::DockBuilderDockWindow("Risk", dock_right_top);
-    ImGui::DockBuilderDockWindow("Config", dock_right_top);
+    ImGui::DockBuilderDockWindow("Account", dock_right_top);
     ImGui::DockBuilderDockWindow("Positions", dock_right_top);
 
     // bottom-right: stats + settings + trade history + log (tabbed)
@@ -259,6 +256,8 @@ static inline void Gui_HandleKeys(TUISharedState *shared) {
         __atomic_store_n(&shared->reload_requested, 1, __ATOMIC_RELEASE);
     if (ImGui::IsKeyPressed(ImGuiKey_S))
         __atomic_store_n(&shared->regime_cycle_requested, 1, __ATOMIC_RELEASE);
+    if (ImGui::IsKeyPressed(ImGuiKey_K))
+        __atomic_store_n(&shared->kill_reset_requested, 1, __ATOMIC_RELEASE);
 }
 
 //==========================================================================
@@ -278,7 +277,7 @@ static inline void *gui_thread_fn(void *arg) {
 
     // trade CSV reader for chart markers + equity curve
     TradeData trades;
-    TradeData_Init(&trades, "btcusdt_order_history.csv");
+    TradeData_Init(&trades, "logging/btcusdt_order_history.csv");
 
     // chart display settings
     ChartSettings chart_settings;
@@ -289,9 +288,9 @@ static inline void *gui_thread_fn(void *arg) {
 
     // trade history + log viewer
     TradeHistory trade_history;
-    TradeHistory_Init(&trade_history, "btcusdt_order_history.csv");
+    TradeHistory_Init(&trade_history, "logging/btcusdt_order_history.csv");
     LogViewer log_viewer;
-    LogViewer_Init(&log_viewer, "engine.log");
+    LogViewer_Init(&log_viewer, "logging/engine.log");
 
     while (gui.running && !__atomic_load_n(&shared->quit_requested, __ATOMIC_ACQUIRE)) {
         if (!Gui_BeginFrame(&gui)) break;
@@ -338,6 +337,7 @@ static inline void *gui_thread_fn(void *arg) {
         CandleAccumulator *ca = shared->candle_acc ? (CandleAccumulator *)shared->candle_acc : NULL;
         GUI_PriceChart(&cs, snap, &trades, &chart_settings, ca, (void *)shared);
         GUI_VolumeChart(&cs, snap, &chart_settings);
+        GUI_LivePnLChart(snap);
         GUI_EquityChart(&trades);
 
         // settings, trade history, log viewer

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jennifer Lewis. All rights reserved.
-// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// Licensed under the MIT License. See LICENSE for details.
 // See LICENSE file in the project root for full license text.
 
 //======================================================================================================
@@ -37,6 +37,22 @@
 //======================================================================================================
 #define CONTROLLER_WARMUP 0
 #define CONTROLLER_ACTIVE 1
+
+// gate reason codes — why buy gate is currently off
+#define GATE_REASON_OK         0   // gate active, has valid price
+#define GATE_REASON_WARMUP     1   // warmup phase (collecting samples)
+#define GATE_REASON_NO_SIGNAL  2   // strategy returned zero price
+#define GATE_REASON_NO_TRADE   3   // no-trade band (signal < fee breakeven)
+#define GATE_REASON_BOOK       4   // book imbalance insufficient
+#define GATE_REASON_DANGER     5   // danger gradient scaled to zero
+#define GATE_REASON_KILL       6   // kill switch active
+#define GATE_REASON_RECOVERY   7   // kill switch recovery period
+#define GATE_REASON_VOLATILE   8   // volatile regime
+#define GATE_REASON_COOLDOWN   9   // post-SL cooldown
+#define GATE_REASON_WIND_DOWN  10  // session wind-down
+#define GATE_REASON_PAUSED     11  // manual pause
+#define GATE_REASON_DOWNTREND  12  // downtrend regime
+#define NUM_GATE_REASONS       13
 //======================================================================================================
 template <unsigned F> struct PortfolioController {
   //================================================================================================
@@ -57,8 +73,10 @@ template <unsigned F> struct PortfolioController {
   FPN<F> danger_crash;          // price threshold where gate zeroes (avg - crash_stddevs * σ)
   FPN<F> danger_range_inv;      // 1 / (warn - crash), precomputed for hot-path multiply
   FPN<F> danger_score;          // current danger score [0, 1] — computed every tick
+  FPN<F> fpn_one;               // precomputed FPN(1.0) — avoids FromDouble conversion on hot path
   int buying_halted;            // centralized halt — checked every tick after gate tracking
   int halt_reason;              // 0=none, 1=kill, 2=recovery, 3=volatile, 4=cooldown, 5=wind_down, 6=paused
+  int gate_reason;              // GATE_REASON_* — why buy gate is off (set at every zeroing point)
   int kill_switch_active;       // 1 = all buying halted (checked every 16th tick)
   int kill_reason;              // 0=none, 1=daily_loss, 2=drawdown
 
@@ -217,6 +235,7 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
   ctrl->session_start_equity = FPN_Zero<F>();  // set on first slow-path equity calc
   ctrl->current_session = -1;  // unset until first slow path
   ctrl->session_mult = FPN_FromDouble<F>(1.0);
+  ctrl->fpn_one = FPN_FromDouble<F>(1.0);
   ctrl->book_imbalance = FPN_Zero<F>();
   ctrl->idle_cycles = 0;
   ctrl->fills_rejected = 0;
@@ -227,6 +246,7 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
   ctrl->kill_recovery_counter = 0;
   ctrl->buying_halted = 0;
   ctrl->halt_reason = 0;
+  ctrl->gate_reason = GATE_REASON_WARMUP;
   ctrl->last_vol_scale = 1.0;
   for (int i = 0; i < 5; i++) {
     ctrl->strategy_stats[i].realized_pnl = FPN_Zero<F>();
@@ -277,6 +297,7 @@ inline void KillSwitch_Activate(PortfolioController<F> *ctrl, int reason) {
     ctrl->kill_reason = reason;
     ctrl->buying_halted = 1;
     ctrl->halt_reason = 1;
+    ctrl->gate_reason = GATE_REASON_KILL;
     ctrl->buy_conds.price = FPN_Zero<F>();
     ctrl->buy_conds.volume = FPN_Zero<F>();
     ctrl->gate_offset = FPN_Zero<F>();
@@ -297,6 +318,13 @@ template <unsigned F>
 inline void Buying_Halt(PortfolioController<F> *ctrl, int reason) {
     ctrl->buying_halted = 1;
     ctrl->halt_reason = reason;
+    // map halt_reason → gate_reason
+    static const int halt_to_gate[] = {
+        GATE_REASON_OK, GATE_REASON_KILL, GATE_REASON_RECOVERY,
+        GATE_REASON_VOLATILE, GATE_REASON_COOLDOWN,
+        GATE_REASON_WIND_DOWN, GATE_REASON_PAUSED
+    };
+    ctrl->gate_reason = (reason >= 0 && reason <= 6) ? halt_to_gate[reason] : GATE_REASON_PAUSED;
     ctrl->buy_conds.price = FPN_Zero<F>();
     ctrl->buy_conds.volume = FPN_Zero<F>();
     ctrl->gate_offset = FPN_Zero<F>();
@@ -400,13 +428,24 @@ inline void RecordExit(PortfolioController<F> *ctrl, int slot, FPN<F> exit_price
     double qty_d = FPN_ToDouble(pos->quantity);
     double delta_pct = (entry_d != 0.0) ? ((exit_d - entry_d) / entry_d) * 100.0 : 0.0;
     const char *reasons[] = {"TP", "SL", "TIME", "SESSION_CLOSE"};
+    {
+      double pnl_d = FPN_ToDouble(pos_pnl);
+      double hold_sec = (tick > entry_tick) ? (double)(tick - entry_tick) * 0.001 : 0.0;
+      static const char *sn[] = {"MR", "MOM", "DIP", "ML", "EMA"};
+      fprintf(stderr, "[TRADE] SELL $%.2f × %.6f %s %s$%.2f %s bal=$%.2f\n",
+              exit_d, qty_d, reasons[reason],
+              pnl_d >= 0 ? "+" : "", pnl_d,
+              (strat >= 0 && strat < 5) ? sn[strat] : "?",
+              FPN_ToDouble(ctrl->balance));
+    }
     TradeLogBuffer_PushSell(&ctrl->trade_buf, tick, exit_d, qty_d, entry_d, delta_pct,
                             reasons[reason], FPN_ToDouble(ctrl->balance),
                             FPN_ToDouble(exit_fee), strat, ctrl->regime.current_regime);
 
-    // balance reconciliation when last position closes
+    // balance reconciliation — only valid when fully flat (no open positions)
+    // with open positions, balance is correctly lower by position cost
     int remaining = Portfolio_CountActive(&ctrl->portfolio);
-    if (remaining <= 1) { // this position may still be counted
+    if (remaining == 0) {
         double bal = FPN_ToDouble(ctrl->balance);
         double expected = FPN_ToDouble(ctrl->config.starting_balance) + FPN_ToDouble(ctrl->realized_pnl);
         double drift = bal - expected;
@@ -487,6 +526,9 @@ inline void PortfolioController_StrategyBuySignal(PortfolioController<F> *ctrl) 
     break;
   }
 
+  // gate reason: set based on whether strategy produced a valid price
+  ctrl->gate_reason = FPN_IsZero(ctrl->buy_conds.price) ? GATE_REASON_NO_SIGNAL : GATE_REASON_OK;
+
   // capture gate offset for hot-path EMA tracking
   // offset = distance from EMA to gate price (strategy-specific, reapplied every tick to live EMA)
   if (!FPN_IsZero(ctrl->buy_conds.price) && !FPN_IsZero(ctrl->ema_price)) {
@@ -524,6 +566,7 @@ inline void PortfolioController_StrategyBuySignal(PortfolioController<F> *ctrl) 
     if (FPN_LessThan(signal_pct, min_signal)) {
       ctrl->buy_conds.price = FPN_Zero<F>();
       ctrl->buy_conds.volume = FPN_Zero<F>();
+      ctrl->gate_reason = GATE_REASON_NO_TRADE;
     }
   }
 }
@@ -628,9 +671,35 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
       }
     }
     if (tripped) {
+      // dump EVERYTHING before activating kill so we can find the root cause
+      double price_d = FPN_ToDouble(current_price);
+      double pv_d = FPN_ToDouble(pv);
+      double bal_d = FPN_ToDouble(ctrl->balance);
+      double eq_d = FPN_ToDouble(equity);
+      uint16_t bmp = ctrl->portfolio.active_bitmap;
+      int npos = __builtin_popcount(bmp);
+      fprintf(stderr, "[KILL] TRIGGER tick=%lu reason=%d bitmap=0x%04X npos=%d\n",
+              ctrl->total_ticks, ctrl->kill_reason, bmp, npos);
+      fprintf(stderr, "[KILL]   price=%.2f pv=%.6f bal=%.2f equity=%.2f\n",
+              price_d, pv_d, bal_d, eq_d);
+      fprintf(stderr, "[KILL]   start=%.2f peak=%.2f daily_pct=%.4f dd_pct=%.4f\n",
+              FPN_ToDouble(ctrl->session_start_equity),
+              FPN_ToDouble(ctrl->peak_equity),
+              FPN_ToDouble(ctrl->config.kill_switch_daily_loss_pct),
+              FPN_ToDouble(ctrl->config.kill_switch_drawdown_pct));
+      // dump each active position
+      uint16_t scan = bmp;
+      while (scan) {
+        int idx = __builtin_ctz(scan);
+        fprintf(stderr, "[KILL]   pos[%d] entry=%.2f qty=%.10f val=%.2f tp=%.2f sl=%.2f\n",
+                idx, FPN_ToDouble(ctrl->portfolio.positions[idx].entry_price),
+                FPN_ToDouble(ctrl->portfolio.positions[idx].quantity),
+                FPN_ToDouble(FPN_Mul(current_price, ctrl->portfolio.positions[idx].quantity)),
+                FPN_ToDouble(ctrl->portfolio.positions[idx].take_profit_price),
+                FPN_ToDouble(ctrl->portfolio.positions[idx].stop_loss_price));
+        scan &= scan - 1;
+      }
       KillSwitch_Activate(ctrl, ctrl->kill_reason);
-      fprintf(stderr, "[KILL] hot-path: equity %.2f — trading halted (reason %d)\n",
-              equity, ctrl->kill_reason);
     }
   }
 
@@ -648,14 +717,19 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
 
     // danger gradient: proportional crash protection between slow-path cycles
     // danger_score ∈ [0, 1]: 0 = safe, 1 = crash. scales gate price toward zero.
-    if (ctrl->config.danger_enabled && !FPN_IsZero(ctrl->danger_range_inv)) {
+    // skip entirely when price is above warn threshold (score would be 0, scale would be 1)
+    if (ctrl->config.danger_enabled && !FPN_IsZero(ctrl->danger_range_inv)
+        && FPN_LessThan(current_price, ctrl->danger_warn)) {
       FPN<F> depth = FPN_SubSat(ctrl->danger_warn, current_price);
       FPN<F> raw = FPN_Mul(depth, ctrl->danger_range_inv);
-      FPN<F> one = FPN_FromDouble<F>(1.0);
       FPN<F> zero = FPN_Zero<F>();
-      ctrl->danger_score = FPN_Min(FPN_Max(raw, zero), one);
-      FPN<F> gate_scale = FPN_SubSat(one, ctrl->danger_score);
+      ctrl->danger_score = FPN_Min(FPN_Max(raw, zero), ctrl->fpn_one);
+      FPN<F> gate_scale = FPN_SubSat(ctrl->fpn_one, ctrl->danger_score);
       ctrl->buy_conds.price = FPN_Mul(ctrl->buy_conds.price, gate_scale);
+      if (FPN_IsZero(ctrl->buy_conds.price) && ctrl->gate_reason == GATE_REASON_OK)
+        ctrl->gate_reason = GATE_REASON_DANGER;
+    } else {
+      ctrl->danger_score = FPN_Zero<F>();
     }
   }
 
@@ -704,6 +778,11 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
           ctrl->strategy_id = ctrl->config.default_strategy;
       PortfolioController_StrategyDispatch(ctrl, current_price);
       ctrl->state = CONTROLLER_ACTIVE;
+      static const char *strat_names[] = {"MR", "Momentum", "SimpleDip", "ML", "EmaCross"};
+      int sid = ctrl->strategy_id;
+      fprintf(stderr, "[SESSION] warmup complete — %d samples, strategy=%s, price=$%.2f\n",
+              ctrl->rolling.count, (sid >= 0 && sid < 5) ? strat_names[sid] : "?",
+              FPN_ToDouble(current_price));
     }
 
     // drain exits during warmup — loaded positions need TP/SL processed
@@ -1004,6 +1083,15 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
       if (fill_ok) {
         ctrl->total_buys++;
         ctrl->idle_cycles = 0;  // reset gate death spiral counter
+        {
+          static const char *sn[] = {"MR", "MOM", "DIP", "ML", "EMA"};
+          int si = ctrl->strategy_id;
+          fprintf(stderr, "[TRADE] BUY $%.2f × %.6f ($%.2f) %s tp=$%.2f sl=$%.2f bal=$%.2f\n",
+                  FPN_ToDouble(fill_price), FPN_ToDouble(sized_qty), FPN_ToDouble(cost),
+                  (si >= 0 && si < 5) ? sn[si] : "?",
+                  FPN_ToDouble(tp_price), FPN_ToDouble(sl_price),
+                  FPN_ToDouble(FPN_SubSat(ctrl->balance, total_cost)));
+        }
         ctrl->balance = FPN_SubSat(ctrl->balance, total_cost);
         ctrl->total_fees = FPN_AddSat(ctrl->total_fees, entry_fee);
 
@@ -1209,6 +1297,12 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
     if (new_regime != old_regime) {
       ctrl->regime.regime_start_tick = ctrl->total_ticks;
       ctrl->regime.regime_start_time = time(NULL);
+      {
+        static const char *rn[] = {"RANGING", "TRENDING", "VOLATILE", "DOWNTREND", "MILD_TREND"};
+        int or_ = (old_regime >= 0 && old_regime < 5) ? old_regime : 0;
+        int nr_ = (new_regime >= 0 && new_regime < 5) ? new_regime : 0;
+        fprintf(stderr, "[REGIME] %s → %s\n", rn[or_], rn[nr_]);
+      }
       // only auto-switch strategy when default_strategy=-1 (regime auto mode)
       // when a specific strategy is selected, regime detection still runs
       // (for display/signals) but doesn't override the strategy
@@ -1265,6 +1359,7 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
   if (!FPN_IsZero(ctrl->config.min_book_imbalance)) {
     int book_ok = FPN_GreaterThanOrEqual(ctrl->book_imbalance, ctrl->config.min_book_imbalance);
     Gate_Zero(&ctrl->buy_conds, book_ok);
+    if (!book_ok) ctrl->gate_reason = GATE_REASON_BOOK;
   }
 
   // CENTRALIZED HALT: single location for all halt conditions
@@ -1278,11 +1373,23 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
     else if (ctrl->kill_recovery_counter > 0)                { halted = 1; reason = 2; }
     else if (ctrl->regime.current_regime == REGIME_VOLATILE) { halted = 1; reason = 3; }
     else if (ctrl->sl_cooldown_counter > 0)                  { halted = 1; reason = 4; }
+    int prev_gate = ctrl->gate_reason;
     if (halted) {
       Buying_Halt(ctrl, reason);
     } else {
       ctrl->buying_halted = 0;
       ctrl->halt_reason = 0;
+    }
+    // log gate state transitions (slow path only, ~1 per state change)
+    if (ctrl->gate_reason != prev_gate) {
+      static const char *gr[] = {
+        "ok", "warmup", "no_signal", "no_trade", "book",
+        "danger", "kill", "recovery", "volatile", "cooldown",
+        "wind_down", "paused", "downtrend"
+      };
+      int gi = (ctrl->gate_reason >= 0 && ctrl->gate_reason < NUM_GATE_REASONS) ? ctrl->gate_reason : 0;
+      int pi = (prev_gate >= 0 && prev_gate < NUM_GATE_REASONS) ? prev_gate : 0;
+      fprintf(stderr, "[GATE] %s → %s\n", gr[pi], gr[gi]);
     }
   }
 }
@@ -1321,6 +1428,9 @@ inline void PortfolioController_CycleRegime(PortfolioController<F> *ctrl) {
     if (next == REGIME_VOLATILE) {
         ctrl->buy_conds.price = FPN_Zero<F>();
         ctrl->buy_conds.volume = FPN_Zero<F>();
+        ctrl->gate_reason = GATE_REASON_VOLATILE;
+    } else if (next == REGIME_TRENDING_DOWN) {
+        ctrl->gate_reason = GATE_REASON_DOWNTREND;
     }
     const char *names[] = {"RANGING", "TRENDING", "VOLATILE", "TRENDING_DOWN", "MILD_TREND"};
     fprintf(stderr, "[ENGINE] regime manually set to %s\n", names[next]);
