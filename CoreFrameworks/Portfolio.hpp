@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jennifer Lewis. All rights reserved.
-// Licensed under the MIT License. See LICENSE for details.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 // See LICENSE file in the project root for full license text.
 
 //======================================================================================================
@@ -74,6 +74,29 @@ template <unsigned F> inline void ExitBuffer_Init(ExitBuffer<F> *buf) {
 
 template <unsigned F> inline void ExitBuffer_Clear(ExitBuffer<F> *buf) {
     buf->count = 0;
+}
+
+// exact net proceeds pending in exit buffer — matches what DrainExits/RecordExit will credit
+// accounts for slippage and fees so equity = balance + portfolio_value + this
+// position data survives bitmap clear so quantity/entry reads are safe here
+template <unsigned F>
+inline FPN<F> ExitBuffer_PendingProceeds(const ExitBuffer<F> *buf, const Position<F> *positions,
+                                          FPN<F> fee_rate, FPN<F> slippage_pct, int max_positions) {
+    FPN<F> total = FPN_Zero<F>();
+    for (uint32_t i = 0; i < buf->count; i++) {
+        int idx = buf->records[i].position_index;
+        if (idx < 0 || idx >= max_positions) continue;
+        // apply slippage to exit price (same as DrainExits)
+        FPN<F> exit_price = buf->records[i].exit_price;
+        if (!FPN_IsZero(slippage_pct)) {
+            FPN<F> slip = FPN_Mul(exit_price, slippage_pct);
+            exit_price = FPN_SubSat(exit_price, slip);
+        }
+        FPN<F> gross = FPN_Mul(exit_price, positions[idx].quantity);
+        FPN<F> fee = FPN_Mul(gross, fee_rate);
+        total = FPN_AddSat(total, FPN_SubSat(gross, fee));
+    }
+    return total;
 }
 //======================================================================================================
 // [FUNCTIONS]

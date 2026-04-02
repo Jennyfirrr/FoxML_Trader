@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.1 — Don't Lose Money on Wins <3
+
+Three safety bugs fixed. All related to positions exiting through the hot-path exit gate.
+
+- **kill switch false trigger fixed** — exit gate clears the position bitmap instantly, but balance isn't credited until the slow-path drain. Between those events equity looked like it crashed. Now uses exact pending proceeds (exit price, fees, slippage) instead of approximate market price
+- **win/loss classification by P&L** — a TP exit where fees ate the profit was counted as a "win". Now wins require positive P&L, not just TP reason. No more 100% win rate on losing trades
+- **fee floor after regime tightening** — regime transitions (TRENDING/MILD_TREND → RANGING, → DOWNTREND) tighten TP with FPN_Min but never re-checked the fee floor. When volatility drops after fill, TP could end up $5 above entry with $6 in round-trip fees. Now enforced after every TP tightening
+- **271 assertions** — 12 new tests covering all three bugs
+
 ## v1.2.0 — Dashboard Polish <3
 
 - **GUI overhaul** — merged 10 panels → 7 (Account, Market), cleaner layout, zero duplication

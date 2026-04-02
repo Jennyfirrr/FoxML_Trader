@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jennifer Lewis. All rights reserved.
-// Licensed under the MIT License. See LICENSE for details.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 // See LICENSE file in the project root for full license text.
 
 //======================================================================================================
@@ -365,9 +365,11 @@ inline void RecordExit(PortfolioController<F> *ctrl, int slot, FPN<F> exit_price
             ctrl->strategy_stats[strat].realized_pnl, pos_pnl);
     }
 
-    // win/loss counters: TP with positive P&L = win, everything else = loss
-    ctrl->wins += (reason == 0);
-    ctrl->losses += (reason != 0);
+    // win/loss counters: TP exit with positive P&L = win, everything else = loss
+    // a TP exit where fees ate the profit is still a loss, not a win
+    int is_profitable = !pos_pnl.sign & !FPN_IsZero(pos_pnl);
+    ctrl->wins += ((reason == 0) & is_profitable);
+    ctrl->losses += !((reason == 0) & is_profitable);
 
     // SL cooldown: adaptive or fixed, only on SL exits
     if (reason == 1) {
@@ -650,7 +652,13 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
   // Portfolio_ComputeValue is O(popcount) — 1 multiply for single-slot mode
   if ((ctrl->total_ticks & 0xF) == 0 && ctrl->config.kill_switch_enabled && !ctrl->buying_halted) {
     FPN<F> pv = Portfolio_ComputeValue(&ctrl->portfolio, current_price);
-    FPN<F> equity = FPN_AddSat(ctrl->balance, pv);
+    // include pending exit proceeds — exit gate clears bitmap before DrainExits credits balance
+    // without this, equity appears crashed between exit gate and drain (false kill trigger)
+    // uses exact exit_price × qty - slippage - fees (matches what RecordExit will credit)
+    FPN<F> pending = ExitBuffer_PendingProceeds(&ctrl->exit_buf, ctrl->portfolio.positions,
+                                                 ctrl->config.fee_rate, ctrl->config.slippage_pct,
+                                                 (int)ctrl->config.max_positions);
+    FPN<F> equity = FPN_AddSat(FPN_AddSat(ctrl->balance, pv), pending);
     int tripped = 0;
     // daily loss: (equity - start) / start < -threshold
     if (!FPN_IsZero(ctrl->session_start_equity)) {
