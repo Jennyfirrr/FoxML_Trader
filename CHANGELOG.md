@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.2 — Show Me the Timestamps <3
+
+- **timestamped engine log** — all [TRADE], [REGIME], [GATE], [KILL], [SESSION] lines now prefixed with [HH:MM:SS] UTC
+- **regime duration** — regime changes show how long the previous regime lasted ("was RANGING for 8m" vs "was RANGING for 12s") so you can see if the detector is flipping on noise
+- **danger meter removed** — the progress bar was ugly, score still shows in gate reason tooltip
+
 ## v1.2.1 — Don't Lose Money on Wins <3
 
 Four safety bugs fixed. All related to positions exiting through the hot-path exit gate.
