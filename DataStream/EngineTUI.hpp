@@ -626,6 +626,122 @@ struct TUIPositionSnap {
     time_t entry_time;    // wall clock entry timestamp (for chart markers)
 };
 
+// FoxML display fields — populated once by MLSnapshot_Populate(), shared by
+// TUI_CopySnapshot and BacktestSnapshot_Copy.  add new ML fields here.
+struct MLSnapshot {
+    // summary (Phase 6C)
+    double cost_bps;           // estimated trade cost in bps (CostModel)
+    double foxml_vol_scale;    // inverse-vol position scale factor (VolScaler)
+    double confidence;         // prediction confidence [0, 1] (ConfidenceScorer)
+    double bandit_blend;       // bandit effective blend ratio [0, blend_ratio]
+    double bandit_weights[5];  // per-strategy bandit weights (normalized)
+    int bandit_active;         // 1 if bandit has enough samples to influence
+    int cost_gate_enabled;     // config mirror for display
+    int foxml_vol_scaling_enabled;
+    int confidence_enabled;
+    int bandit_enabled;
+    // bandit detail (Phase 7C)
+    int bandit_pulls[5];       // per-arm pull counts
+    double bandit_avg_reward[5]; // per-arm average reward (bps)
+    double bandit_probs[5];    // per-arm selection probabilities
+    int bandit_total_steps;    // total bandit updates
+    char bandit_arm_names[5][32]; // human-readable arm labels
+    // confidence detail (Phase 7C)
+    double confidence_ic;      // information coefficient (rank correlation)
+    double confidence_rmse;    // rolling RMSE of predictions
+    double confidence_freshness; // data recency factor [0, 1]
+    // cost detail (Phase 7C)
+    double cost_spread;        // spread component (bps)
+    double cost_timing;        // volatility timing component (bps)
+    double cost_impact;        // market impact component (bps)
+    double cost_breakeven;     // breakeven return threshold (bps)
+    // model info (Phase 7C)
+    char ml_model_path[256];
+    int ml_model_loaded;       // 1 if buy-signal model active
+    double ml_last_prediction; // most recent model output
+    char regime_model_path[256];
+    int regime_model_loaded;   // 1 if regime model active
+    // prediction history ring buffer (Phase 7D)
+    static constexpr int PRED_HISTORY_LEN = 240;
+    double pred_history[PRED_HISTORY_LEN];
+    double conf_history[PRED_HISTORY_LEN];
+    int pred_head;
+    int pred_count;
+};
+
+// populates MLSnapshot from controller state.
+// called by TUI_CopySnapshot and BacktestSnapshot_Copy — one copy function, not two.
+template <unsigned F>
+static inline void MLSnapshot_Populate(MLSnapshot *snap, const PortfolioController<F> *ctrl) {
+    // summary fields
+    snap->cost_bps = ctrl->last_cost_bps;
+    snap->foxml_vol_scale = ctrl->foxml_vol_scale;
+    snap->confidence = ctrl->last_confidence;
+    snap->cost_gate_enabled = ctrl->config.cost_gate_enabled;
+    snap->foxml_vol_scaling_enabled = ctrl->config.foxml_vol_scaling_enabled;
+    snap->confidence_enabled = ctrl->config.confidence_enabled;
+    snap->bandit_enabled = ctrl->config.bandit_enabled;
+
+    // bandit detail
+    snap->bandit_total_steps = ctrl->bandit.total_steps;
+    if (ctrl->config.bandit_enabled) {
+        snap->bandit_blend = Bandit_EffectiveBlend(&ctrl->bandit);
+        snap->bandit_active = (ctrl->bandit.total_steps >= ctrl->bandit.min_samples) ? 1 : 0;
+        double bw[BANDIT_MAX_ARMS], bp[BANDIT_MAX_ARMS];
+        Bandit_GetWeights(&ctrl->bandit, bw);
+        Bandit_GetProbabilities(&ctrl->bandit, bp);
+        for (int i = 0; i < 5; i++) {
+            snap->bandit_weights[i] = bw[i];
+            snap->bandit_probs[i] = bp[i];
+            snap->bandit_pulls[i] = ctrl->bandit.pulls[i];
+            snap->bandit_avg_reward[i] = (ctrl->bandit.pulls[i] > 0)
+                ? ctrl->bandit.cum_reward[i] / ctrl->bandit.pulls[i] : 0.0;
+            strncpy(snap->bandit_arm_names[i], ctrl->bandit.arm_names[i], 31);
+            snap->bandit_arm_names[i][31] = '\0';
+        }
+    } else {
+        snap->bandit_blend = 0.0;
+        snap->bandit_active = 0;
+        for (int i = 0; i < 5; i++) {
+            snap->bandit_weights[i] = 0.0;
+            snap->bandit_probs[i] = 0.0;
+            snap->bandit_pulls[i] = 0;
+            snap->bandit_avg_reward[i] = 0.0;
+            snap->bandit_arm_names[i][0] = '\0';
+        }
+    }
+
+    // confidence detail — IC and RMSE are the stable components,
+    // freshness is time-dependent and computed live by ConfidenceScorer_Compute
+    snap->confidence_ic = RollingIC_Compute(&ctrl->confidence.ic);
+    snap->confidence_rmse = RollingRMSE_Compute(&ctrl->confidence.rmse);
+    snap->confidence_freshness = Confidence_Stability(snap->confidence_rmse); // stability proxy
+
+    // cost detail
+    snap->cost_spread = ctrl->last_costs.spread_cost;
+    snap->cost_timing = ctrl->last_costs.timing_cost;
+    snap->cost_impact = ctrl->last_costs.impact_cost;
+    snap->cost_breakeven = CostModel_Breakeven(ctrl->last_cost_bps);
+
+    // model info
+    snap->ml_model_loaded = Model_IsLoaded(&ctrl->ml_strategy.buy_model);
+    snap->ml_last_prediction = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
+    strncpy(snap->ml_model_path, ctrl->ml_strategy.buy_model.model_path, 255);
+    snap->ml_model_path[255] = '\0';
+    snap->regime_model_loaded = Model_IsLoaded(&ctrl->regime_model);
+    strncpy(snap->regime_model_path, ctrl->regime_model.model_path, 255);
+    snap->regime_model_path[255] = '\0';
+
+    // push prediction into ring buffer (accumulates across calls)
+    if (snap->ml_model_loaded) {
+        snap->pred_history[snap->pred_head] = snap->ml_last_prediction;
+        snap->conf_history[snap->pred_head] = snap->confidence;
+        snap->pred_head = (snap->pred_head + 1) % MLSnapshot::PRED_HISTORY_LEN;
+        if (snap->pred_count < MLSnapshot::PRED_HISTORY_LEN)
+            snap->pred_count++;
+    }
+}
+
 struct TUISnapshot {
     // market
     double price, volume;
@@ -735,17 +851,8 @@ struct TUISnapshot {
     // no-trade band
     int no_trade_band_blocked; // 1 if last signal was suppressed by no-trade band
     double signal_strength;    // |price - avg| / avg as percentage
-    // FoxML integration (Phase 6C)
-    double cost_bps;           // estimated trade cost in bps (CostModel)
-    double foxml_vol_scale;    // inverse-vol position scale factor (VolScaler)
-    double confidence;         // prediction confidence [0, 1] (ConfidenceScorer)
-    double bandit_blend;       // bandit effective blend ratio [0, blend_ratio]
-    double bandit_weights[5];  // per-strategy bandit weights (normalized)
-    int bandit_active;         // 1 if bandit has enough samples to influence
-    int cost_gate_enabled;     // config mirror for display
-    int foxml_vol_scaling_enabled;
-    int confidence_enabled;
-    int bandit_enabled;
+    // FoxML integration (Phase 6C) — populated by MLSnapshot_Populate()
+    MLSnapshot ml;
     // per-strategy stats
     struct StrategyStatsSnap {
       double pnl;
@@ -784,12 +891,26 @@ struct TUISharedState {
 //======================================================================================================
 // runs on engine thread, every slow-path cycle. converts FPN→double.
 //======================================================================================================
+// overload: explicit price/volume (used by backtest — no DataStream available)
+template <unsigned F>
+static inline void TUI_CopySnapshot(TUISnapshot *snap,
+                                      const PortfolioController<F> *ctrl,
+                                      double price_d, double volume_d);
+
+// overload: DataStream (used by live engine)
 template <unsigned F>
 static inline void TUI_CopySnapshot(TUISnapshot *snap,
                                       const PortfolioController<F> *ctrl,
                                       const DataStream<F> *stream) {
-    snap->price  = stream->price_d;   // use stashed double (no FPN_ToDouble)
-    snap->volume = stream->volume_d;
+    TUI_CopySnapshot(snap, ctrl, stream->price_d, stream->volume_d);
+}
+
+template <unsigned F>
+static inline void TUI_CopySnapshot(TUISnapshot *snap,
+                                      const PortfolioController<F> *ctrl,
+                                      double price_d, double volume_d) {
+    snap->price  = price_d;
+    snap->volume = volume_d;
     snap->state_warmup = (ctrl->state == CONTROLLER_WARMUP);
     snap->is_paused = FPN_IsZero(ctrl->buy_conds.price) && !snap->state_warmup;
     snap->start_time = 0; // TUI thread computes uptime from its own start_time
@@ -833,7 +954,6 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
     snap->long_gate_ok = !snap->long_gate_enabled || (snap->long_rel_slope >= min_ls);
 
     // portfolio + positions
-    double price_d = snap->price;
     double fee_r = FPN_ToDouble(ctrl->config.fee_rate);
     snap->active_count = Portfolio_CountActive(&ctrl->portfolio);
     snap->max_positions = (int)ctrl->config.max_positions;
@@ -942,25 +1062,8 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
       snap->no_trade_band_blocked = ctrl->config.no_trade_band_enabled &&
           (snap->signal_strength < min_signal) && !snap->state_warmup;
     }
-    // FoxML integration (Phase 6C)
-    snap->cost_bps = ctrl->last_cost_bps;
-    snap->foxml_vol_scale = ctrl->foxml_vol_scale;
-    snap->confidence = ctrl->last_confidence;
-    snap->cost_gate_enabled = ctrl->config.cost_gate_enabled;
-    snap->foxml_vol_scaling_enabled = ctrl->config.foxml_vol_scaling_enabled;
-    snap->confidence_enabled = ctrl->config.confidence_enabled;
-    snap->bandit_enabled = ctrl->config.bandit_enabled;
-    if (ctrl->config.bandit_enabled) {
-      snap->bandit_blend = Bandit_EffectiveBlend(&ctrl->bandit);
-      snap->bandit_active = (ctrl->bandit.total_steps >= ctrl->bandit.min_samples) ? 1 : 0;
-      double bw[BANDIT_MAX_ARMS];
-      Bandit_GetWeights(&ctrl->bandit, bw);
-      for (int i = 0; i < 5; i++) snap->bandit_weights[i] = bw[i];
-    } else {
-      snap->bandit_blend = 0.0;
-      snap->bandit_active = 0;
-      for (int i = 0; i < 5; i++) snap->bandit_weights[i] = 0.0;
-    }
+    // FoxML integration (Phase 6C) — single populate function
+    MLSnapshot_Populate(&snap->ml, ctrl);
     // per-strategy reward attribution
     for (int i = 0; i < 5; i++) {
       snap->strat_stats[i].pnl   = FPN_ToDouble(ctrl->strategy_stats[i].realized_pnl);

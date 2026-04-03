@@ -1,6 +1,6 @@
-// FoxML Trader — tick-level crypto trading engine
-// Copyright (c) 2026 Jennifer Lewis
-// Licensed under the MIT License. See LICENSE file for details.
+// Copyright (c) 2026 Jennifer Lewis. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+// See LICENSE file in the project root for full license text.
 
 
 //======================================================================================================
@@ -50,7 +50,9 @@ template <unsigned F> inline void OrderPool_init(OrderPool<F> *pool, uint32_t ca
 }
 
 template <unsigned F> inline CurrentOrder<F> *OrderPool_Allocate(OrderPool<F> *pool) {
-    uint32_t index = __builtin_ctzll(~pool->bitmap);
+    uint64_t free_mask = ~pool->bitmap;
+    if (!free_mask) return NULL; // pool full
+    uint32_t index = __builtin_ctzll(free_mask);
     pool->bitmap |= (1ULL << index);
     return &pool->slots[index];
 }

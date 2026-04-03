@@ -11,14 +11,13 @@ use_testnet=0                   # 1 = use binance testnet (fake data, safe for t
 use_binance_us=0                # 1 = use binance US endpoint instead of global
 poll_timeout_ms=100             # how long to wait for new data before running engine tick (ms)
 reconnect_delay=5               # seconds to wait before reconnecting after disconnect
-use_real_money=0                # 0 = paper trading (safe default)
 
 # session lifecycle
 wind_down_minutes=5             # minutes before 24h boundary to stop new buys and wind down
 
 # warmup phase
-warmup_ticks=100                # minimum raw ticks before trading
-min_warmup_samples=128          # wait for short window to fill (128 x poll_interval ticks)
+warmup_ticks=128                # minimum raw ticks before trading
+min_warmup_samples=128          # wait for short window to fill (128 × poll_interval ≈ 71 min at BTC rate)
 
 #==============================================================================
 # REGRESSION GATE
@@ -27,27 +26,28 @@ min_warmup_samples=128          # wait for short window to fill (128 x poll_inte
 # buy more aggressively; if losing, tighten up. these control that feedback loop.
 
 poll_interval=100               # ticks between slow-path runs (regression, adaptation, etc)
-r2_threshold=0.30               # min R^2 to trust regression (0-1, higher = more conservative)
+r2_threshold=0.30               # min R² to trust regression (0-1, higher = more conservative)
 slope_scale_buy=0.50            # how much P&L slope shifts the buy price (higher = more reactive)
-max_shift=0.001                 # max buy gate drift as fraction of price (0.001 = 0.1%)
+max_shift=0.001                 # max buy gate drift as fraction of price (0.001 = 0.1% = ~$70 at BTC $70k)
 
 #==============================================================================
 # PAPER TRADING
 #==============================================================================
 starting_balance=10000.00       # initial paper trading balance ($)
 fee_rate=0.10                   # trading fee per side (%, 0.10 = 0.1% per trade)
-risk_pct=15.00                  # fraction of balance per position (%, 15 = $1500 at $10k balance)
-slippage_pct=0.00               # simulated execution slippage (%, 0 = disabled, 0.05 = 0.05%)
+risk_pct=05.00                  # fraction of balance per position (%, 15 = $1500 at $10k balance)
+slippage_pct=0.05               # simulated execution slippage (%, 0 = disabled, 0.05 = 0.05% worse on entry/exit)
 
 #==============================================================================
 # EXIT CONDITIONS
 #==============================================================================
 # TP and SL are computed from rolling volatility (stddev) at fill time.
 # these percentages are multiplied by 100 to get the stddev multiplier:
-# e.g. 6.00% -> 6.0x stddev. at stddev=$10, TP = entry + $60, SL = entry - $25.
+# e.g. 6.00% → 6.0x stddev. at stddev=$10, TP = entry + $60, SL = entry - $25.
+# percentage fallback is used when rolling stats aren't ready yet.
 
-take_profit_pct=3.00
-stop_loss_pct=6.00
+take_profit_pct=3.00          # take profit (%, also used as stddev multiplier)
+stop_loss_pct=1.50             # stop loss (%, also used as stddev multiplier)
 
 #==============================================================================
 # ENTRY FILTERS
@@ -55,15 +55,15 @@ stop_loss_pct=6.00
 # these control WHEN the strategy buys. adapted by P&L regression at runtime.
 # initial values set here, then the engine loosens/tightens based on performance.
 
-volume_multiplier=1.00          # only buy when tick volume >= this * rolling avg
-entry_offset_pct=0.200
-spacing_multiplier=1.50         # min distance between entries = stddev * this
+volume_multiplier=3.00          # only buy when tick volume >= this * rolling avg (filters noise)
+entry_offset_pct=0.15           # buy gate offset below rolling mean (%, 0.15 = 0.15% dip required)
+spacing_multiplier=2.00         # min distance between entries = stddev * this (prevents clustering)
 
 # how far the adaptive filters can drift from initial values
-offset_min=0.03                 # most aggressive offset (%, smallest dip to buy)
+offset_min=0.05                 # most aggressive offset (%, smallest dip to buy)
 offset_max=0.50                 # most defensive offset (%, largest dip required)
-vol_mult_min=0.30               # most aggressive volume filter (lowest multiplier)
-vol_mult_max=4.00               # most defensive volume filter (highest multiplier)
+vol_mult_min=1.50               # most aggressive volume filter (lowest multiplier)
+vol_mult_max=6.00               # most defensive volume filter (highest multiplier)
 filter_scale=0.50               # how fast filters adapt (higher = faster response to P&L)
 
 #==============================================================================
@@ -71,139 +71,202 @@ filter_scale=0.50               # how fast filters adapt (higher = faster respon
 #==============================================================================
 max_drawdown_pct=10.00          # halt ALL buying if total P&L drops below this % of starting balance
 max_exposure_pct=50.00          # max % of balance deployed in open positions
-max_positions=6                 # max simultaneous open positions (1-16)
+max_positions=1                 # max simultaneous open positions (1-16)
 
 #==============================================================================
 # ENHANCED BUY SIGNAL
 #==============================================================================
 # stddev-scaled offset: buy_price = avg - (stddev * mult)
 # scales with volatility — wider dips required in volatile markets, tighter in calm ones
+# set to 0 to use percentage-based offset instead
 
-offset_stddev_mult=1.00         # stddev multiplier for buy offset (0 = use entry_offset_pct instead)
-offset_stddev_min=0.20          # adaptation lower bound (most aggressive, 0.5 stddev dip)
+offset_stddev_mult=1.50         # stddev multiplier for buy offset (0 = use entry_offset_pct instead)
+offset_stddev_min=0.50          # adaptation lower bound (most aggressive, 0.5 stddev dip)
 offset_stddev_max=4.00          # adaptation upper bound (most defensive, 4.0 stddev dip)
 
 # multi-timeframe gate: blocks buys when the 512-tick window shows a downtrend
-min_long_slope=-0.0001          # block MR buys when 512-tick relative slope < this
+# uses relative slope (slope/price), so the same value works on any asset at any price
+# negative = allow mild drops, 0 = disabled
+min_long_slope=-0.00005         # block when price dropping faster than 0.005%/tick
 
 #==============================================================================
 # TRAILING TAKE-PROFIT
 #==============================================================================
 # when price runs past the original TP in a strong trend, the TP ratchets up
 # to trail the price. captures extended runs instead of exiting at the first target.
+# hold_score = (slope/stddev) * R² — requires the trend to be BOTH strong AND consistent.
+# set tp_hold_score to 0 to disable (use fixed TP).
 
-tp_hold_score=0.10              # min score to hold past TP (0 = disabled, 0.1-0.3 typical)
-tp_trail_mult=1.00              # trailing TP distance in stddevs below price
-sl_trail_mult=2.00              # trailing SL distance in stddevs below price
-fee_floor_mult=3.00             # TP floor = entry x fee_rate x this (3.0 = breakeven + margin)
+tp_hold_score=0.15              # min score to hold past TP (0 = disabled, 0.1-0.3 typical)
+tp_trail_mult=1.00              # trailing TP distance in stddevs below price (0.5-2.0 recommended)
+sl_trail_mult=2.00              # trailing SL distance in stddevs below price (wider than TP)
+fee_floor_mult=3.00             # TP floor = entry × fee_rate × this (3.0 = 2x round-trip + 1x margin)
+min_sl_tp_ratio=0.50            # min SL distance as fraction of TP distance (0.5 = 2:1 reward/risk)
+ror_tp_bonus=1.20               # TP multiplier when trend is accelerating (1.2 = 20% wider)
+momentum_tp_r2_min=0.50         # TP scale at R²=0 (0.5 = half base TP when uncertain)
+momentum_sl_r2_max=1.50         # SL scale at R²=0 (1.5 = wider SL in choppy markets)
+
+#==============================================================================
+# ADAPTATION SPEED
+#==============================================================================
+# controls how fast the engine adjusts filters based on P&L regression
+# higher = more aggressive adaptation, lower = slower/smoother changes
+
+squeeze_decay=0.10              # idle squeeze rate per cycle (10% of gap toward floor)
+offset_adapt_scale=0.001        # P&L regression → offset_pct shift strength
+stddev_adapt_scale=0.10         # P&L regression → stddev/breakout shift strength
+vol_adapt_scale=0.10            # P&L regression → volume_mult shift strength
+breakout_min=0.50               # momentum breakout floor in stddevs (idle squeeze target)
+slow_path_max_secs=3            # wall-time floor between slow-path cycles (seconds)
 
 #==============================================================================
 # TIME-BASED EXIT
 #==============================================================================
-max_hold_ticks=75000            # close after this many ticks (~4-5 hours at 3 ticks/sec)
+# close positions held too long with insufficient gain. frees capital trapped
+# in positions where TP became unreachable (e.g. volatility dropped after entry).
+# only closes if gain is below min_hold_gain_pct — profitable positions are kept.
+
+max_hold_ticks=50000            # close after this many ticks (~4-5 hours at 3 ticks/sec)
 min_hold_gain_pct=0.10          # only time-exit if gain < this % (0.10 = 0.1%)
 
 #==============================================================================
 # REGIME DETECTION
 #==============================================================================
 # classifies market as RANGING (mean reversion), TRENDING (momentum), or VOLATILE (pause)
+# uses rolling price slope, R², and stddev to determine regime
+# hysteresis prevents rapid switching between strategies
 
-regime_slope_threshold=0.00002  # legacy (unused — crossover replaced slope-based detection)
-regime_crossover_threshold=0.0005  # EMA/SMA spread for TRENDING
-regime_r2_threshold=70.00       # min R^2 consistency for TRENDING (%, 70 = 0.70)
-regime_volatile_stddev=0.0005   # stddev/price ratio for VOLATILE detection
-regime_vol_spike_ratio=2.0      # variance spike: short/long variance > this = volatile
-regime_hysteresis=5             # slow-path cycles before regime switch
+regime_slope_threshold=0.00002  # relative slope for TRENDING detection (≈$180 move over 128 ticks at BTC $70k)
+regime_r2_threshold=70.00       # min R² consistency for TRENDING (%, 70 = 0.70)
+regime_volatile_stddev=0.0005   # stddev/price ratio for VOLATILE detection (legacy, kept for compat)
+regime_vol_spike_ratio=2.0      # variance spike: short/long variance > this = volatile (self-adapting)
+regime_hysteresis=5             # slow-path cycles before regime switch (5 = ~2.5 min at BTC rate)
 
 #==============================================================================
 # MOMENTUM STRATEGY
 #==============================================================================
-momentum_breakout_mult=1.50     # buy when price > avg + stddev * this
-momentum_tp_mult=3.00           # TP distance in stddevs
-momentum_sl_mult=1.50           # SL distance in stddevs
-momentum_r2_min=0.40            # min R^2 to enter momentum
-min_stddev_pct=0.00005          # skip fills when stddev/price < this
-min_buy_delta=-0.30             # min volume delta for MR buys
-vwap_offset=0.00                # buy below VWAP by this fraction (0 = disabled)
+# buys breakouts ABOVE the rolling average (opposite of mean reversion)
+# activates when regime detector identifies TRENDING market
 
-#==============================================================================
-# GATE RECOVERY
-#==============================================================================
-idle_reset_cycles=30            # cycles before gate decay (0 = disabled)
-
-#==============================================================================
-# PARTIAL EXITS (SCALING OUT)
-#==============================================================================
-partial_exit_enabled=1          # 0 = full exits only, 1 = split into two legs
-partial_exit_pct=0.50           # fraction of qty for TP1 leg (0.5 = 50/50 split)
-tp2_mult=2.00                   # TP2 distance = TP1 distance * this
-breakeven_on_partial=1          # move remaining SL to entry price after TP1 hit
-
-#==============================================================================
-# ORDER BOOK (L2 DEPTH)
-#==============================================================================
-depth_enabled=0                 # 0 = trade stream only, 1 = also subscribe to depth
-min_book_imbalance=0.00         # require bid excess to buy (0 = disabled)
-
-#==============================================================================
-# SESSION AWARENESS
-#==============================================================================
-session_filter_enabled=1        # 0 = disabled (treat all hours the same)
-session_asian_mult=1.50         # wider gates during low-vol Asian session
-session_european_mult=1.00      # normal during European session
-session_us_mult=0.80            # tighter gates during US session (best liquidity)
-session_overnight_mult=1.30     # wider gates overnight
-
-#==============================================================================
-# STRATEGY SELECTION
-#==============================================================================
-# -1 = regime auto (MR in ranging, Momentum in trending)
-#  0 = Mean Reversion only        1 = Momentum only
-#  2 = Simple Dip                 3 = ML (model-driven)
-
-default_strategy=2
-
-#==============================================================================
-# EMA GATE (PROACTIVE ENTRY)
-#==============================================================================
-gate_ema_enabled=1              # 0 = use rolling avg (legacy), 1 = use EMA for gate
-gate_ema_alpha=0.9900
-
-#==============================================================================
-# RISK INFRASTRUCTURE
-#==============================================================================
-# kill switch: sticky trading halt on daily loss or drawdown breach
-kill_switch_enabled=1           # 0 = disabled, 1 = enabled
-kill_switch_daily_loss_pct=3.00 # max daily loss before kill (%)
-kill_switch_drawdown_pct=5.00   # max drawdown from session peak (%)
-kill_recovery_warmup=50         # slow-path cycles to observe after kill reset
-
-# vol-scaled sizing: scale position qty inversely with volatility
-vol_sizing_enabled=1            # 0 = fixed risk_pct sizing, 1 = vol-scaled
-vol_scale_min=0.25              # minimum scale factor (25% of base qty)
-vol_scale_max=2.00              # maximum scale factor (200% of base qty)
-
-# no-trade band: suppress entries when signal strength < fee breakeven
-no_trade_band_enabled=1         # 0 = disabled, 1 = cost-aware signal gate
-no_trade_band_mult=3.00         # signal must exceed fee_rate * this to trade
-
-#==============================================================================
-# ML INFERENCE (experimental — requires -DUSE_XGBOOST=ON or -DUSE_LIGHTGBM=ON)
-#==============================================================================
-# 0=disabled (default, zero overhead), 1=xgboost, 2=lightgbm
-ml_backend=0
-ml_model_path=
-ml_buy_threshold=0.60           # prediction > this = buy signal
-ml_tp_pct=1.50                  # take profit % for ML positions
-ml_sl_pct=0.80                  # stop loss % for ML positions
-
-# regime enrichment model (Mode A — improves classification for all strategies)
-regime_model_backend=0
-regime_model_path=
-regime_model_weight=2           # score weight added to trending_score
+momentum_breakout_mult=1.50     # buy when price > avg + stddev * this (1.5 = 1.5σ above avg)
+momentum_tp_mult=3.00           # TP distance in stddevs (wider than MR to let trends run)
+momentum_sl_mult=1.00           # SL distance in stddevs (tighter than MR, cut losers fast)
 
 #==============================================================================
 # TUI
 #==============================================================================
 tui_enabled=1                   # 0 = headless mode (for VPS/tmux), 1 = terminal dashboard
 tui_render_interval=10          # render every N ticks (higher = less terminal thrash)
+log_file=engine.log             # stderr redirect when tui_enabled=0 (append mode, tail -f friendly)
+
+#==============================================================================
+# LIVE TRADING (experimental, untested)
+#==============================================================================
+# requires secrets.cfg with api_key and api_secret (gitignored, never commit)
+# US users: get keys from binance.us (Account Settings > API Management) and set use_binance_us=1
+# global users: get keys from binance.com, or testnet from testnet.binance.vision
+# WARNING: use at your own risk — not validated on a live exchange
+
+use_real_money=0                # 0 = paper trading (default safe), 1 = real orders via REST API
+# use_binance_us=1              # uncomment for Binance US (required for US-based users)
+
+#==============================================================================
+# KILL SWITCH
+#==============================================================================
+# halts trading when session losses exceed threshold. resets at session boundary.
+# press 'k' in TUI to manually reset.
+
+kill_switch_enabled=1           # 0 = disabled, 1 = active
+kill_switch_daily_loss_pct=3.00 # halt if equity drops this % from session start
+kill_switch_drawdown_pct=5.00   # halt if this % below intra-session peak
+kill_recovery_warmup=10         # slow-path cycles to observe after kill reset before re-entering
+
+#==============================================================================
+# EMA GATE
+#==============================================================================
+# optional proactive buy gate: smooths price into an EMA, only buys below it.
+# prevents buying into extended rallies. disabled by default.
+
+gate_ema_enabled=0              # 0 = disabled, 1 = gate buys below EMA
+gate_ema_alpha=0.997            # EMA smoothing (0.99 = fast, 0.999 = slow)
+
+#==============================================================================
+# DANGER GRADIENT
+#==============================================================================
+# tightens buy gate proportionally as price drops below rolling avg.
+# at crash_stddevs, gate is fully zeroed (no buys during crashes).
+
+danger_enabled=1                # 0 = disabled, 1 = active
+danger_warn_stddevs=3.0         # gate begins tightening at this σ below avg
+danger_crash_stddevs=6.0        # gate fully zeroed at this σ (crash protection)
+
+#==============================================================================
+# VOL-SCALED SIZING
+#==============================================================================
+# scales position size inversely with volatility — smaller in volatile markets,
+# larger in calm ones. targets consistent risk per trade.
+
+vol_sizing_enabled=0            # 0 = fixed risk_pct, 1 = vol-scaled
+vol_scale_min=0.25              # minimum scale factor (0.25 = at least 25% of base qty)
+vol_scale_max=2.00              # maximum scale factor (2.0 = at most 200% of base qty)
+
+#==============================================================================
+# NO-TRADE BAND
+#==============================================================================
+# suppresses entries when the buy signal is too weak to clear round-trip fees.
+
+no_trade_band_enabled=1         # 0 = disabled, 1 = active
+no_trade_band_mult=3.00         # signal must exceed fee_rate × this to trade
+
+#==============================================================================
+# SESSION FILTERS
+#==============================================================================
+# per-session volume gate multipliers (UTC). higher = more selective.
+# liquidity varies by session — US has deepest books, Asian thinnest.
+
+session_filter_enabled=0        # 0 = disabled, 1 = apply session multipliers
+session_asian_mult=1.50         # 00-07 UTC
+session_european_mult=1.20      # 07-13 UTC
+session_us_mult=0.80            # 13-20 UTC
+session_overnight_mult=1.30     # 20-00 UTC
+
+#==============================================================================
+# GATE RECOVERY
+#==============================================================================
+# prevents permanent lockout after consecutive losses
+
+idle_reset_cycles=50            # slow-path cycles with no fill before gate decay
+sl_cooldown_cycles=5            # slow-path cycles to pause after stop loss
+sl_cooldown_adaptive=1          # 0 = fixed cycles, 1 = scale by trend confidence at SL time
+
+#==============================================================================
+# PARTIAL EXITS
+#==============================================================================
+# split exits: take partial profit at TP1, ride remainder to TP2
+
+partial_exit_enabled=0          # 0 = single exit at TP, 1 = split exits
+partial_exit_pct=0.50           # fraction to exit at TP1 (0.50 = 50%)
+tp2_mult=2.00                   # TP2 = TP1 distance × this
+breakeven_on_partial=1          # move SL to breakeven after TP1 hit
+
+#==============================================================================
+# ML INFERENCE
+#==============================================================================
+# XGBoost or LightGBM model for buy signals. train in foxml_suite, load here.
+# model must match current MODEL_FORMAT_VERSION or it will be rejected.
+
+ml_backend=0                    # 0 = disabled, 1 = xgboost, 2 = lightgbm
+ml_model_path=                  # path to buy-signal model file (e.g. models/buy_signal.xgb)
+ml_buy_threshold=0.50           # prediction threshold for buy signal (0.50 = 50% confidence)
+
+#==============================================================================
+# FOXML INTEGRATION
+#==============================================================================
+# shared ML modules ported from FoxML Python stack. all default OFF.
+
+cost_gate_enabled=0             # suppress entries when estimated trade cost > TP target
+foxml_vol_scaling_enabled=0     # scale position size inversely with volatility
+foxml_vol_scaling_z_max=3.0     # z-score clipping threshold for vol scaler
+bandit_enabled=0                # blend regime strategy with Exp3-IX bandit weights
+bandit_blend_ratio=0.30         # max bandit influence fraction (ramps from 0% to this)
+confidence_enabled=0            # dynamic buy threshold from prediction quality scoring

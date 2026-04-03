@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(foxml_trader CXX)
+project(tick_trader CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # engine binary — ANSI TUI (zero deps, diff-based rendering)
 #===============================================================================
 add_executable(engine main.cpp)
-target_compile_options(engine PRIVATE -O3 -march=native -funroll-loops -flto -Wno-template-body)
+target_compile_options(engine PRIVATE -O3 -march=native -funroll-loops -flto)
 target_compile_definitions(engine PRIVATE MULTICORE_TUI USE_ANSI_TUI LICENSE_BYPASS)
 target_link_libraries(engine PRIVATE ssl crypto pthread)
 
@@ -18,7 +18,7 @@ target_link_libraries(engine PRIVATE ssl crypto pthread)
 option(LATENCY_PROFILING "Enable RDTSCP latency profiling in TUI" OFF)
 option(LATENCY_LITE "Lite profiling: 2 rdtscp instead of 4" OFF)
 option(LATENCY_BENCH "Headless profiling to stderr" OFF)
-option(USE_NATIVE_128 "FPN<64> forwards to FP64 __uint128_t (experimental)" OFF)
+option(USE_NATIVE_128 "FPN<64> forwards to FP64 __uint128_t" ON)
 option(BUSY_POLL "Spin-poll instead of sleeping in poll() (experimental)" OFF)
 option(USE_XGBOOST "Link XGBoost C API for ML inference" OFF)
 option(USE_LIGHTGBM "Link LightGBM C API for ML inference" OFF)
@@ -54,7 +54,7 @@ endif()
 #===============================================================================
 # engine_gui binary — Dear ImGui + implot (SDL2 + OpenGL3)
 #===============================================================================
-option(USE_IMGUI_GUI "Build engine_gui with Dear ImGui + implot (requires SDL2, OpenGL)" OFF)
+option(USE_IMGUI_GUI "Build engine_gui with Dear ImGui + implot (requires SDL2, OpenGL)" ON)
 
 if(USE_IMGUI_GUI)
     find_package(PkgConfig REQUIRED)
@@ -90,7 +90,7 @@ if(USE_IMGUI_GUI)
     )
 
     add_executable(engine_gui main.cpp)
-    target_compile_options(engine_gui PRIVATE -O3 -march=native -funroll-loops -flto -Wno-template-body)
+    target_compile_options(engine_gui PRIVATE -O3 -march=native -funroll-loops -flto)
     target_compile_definitions(engine_gui PRIVATE
         MULTICORE_TUI USE_IMGUI_GUI LICENSE_BYPASS
     )
@@ -123,10 +123,44 @@ if(USE_IMGUI_GUI)
 endif()
 
 #===============================================================================
+# foxml_suite — backtesting + ML training workstation
+#===============================================================================
+if(USE_IMGUI_GUI)
+    add_executable(foxml_suite foxml_suite.cpp)
+    target_compile_options(foxml_suite PRIVATE -O3 -march=native -funroll-loops -flto)
+    target_compile_definitions(foxml_suite PRIVATE
+        FOXML_SUITE LICENSE_BYPASS MULTICORE_TUI
+    )
+    target_include_directories(foxml_suite PRIVATE
+        ${IMGUI_DIR}
+        ${IMGUI_DIR}/backends
+        ${IMPLOT_DIR}
+        ${SDL2_INCLUDE_DIRS}
+    )
+    target_link_libraries(foxml_suite PRIVATE
+        imgui_lib
+        ${SDL2_LIBRARIES}
+        OpenGL::GL
+        pthread
+    )
+    if(USE_NATIVE_128)
+        target_compile_definitions(foxml_suite PRIVATE USE_NATIVE_128)
+    endif()
+    if(USE_XGBOOST)
+        target_compile_definitions(foxml_suite PRIVATE USE_XGBOOST)
+        target_link_libraries(foxml_suite PRIVATE xgboost::xgboost)
+    endif()
+    if(USE_LIGHTGBM)
+        target_compile_definitions(foxml_suite PRIVATE USE_LIGHTGBM)
+        target_link_libraries(foxml_suite PRIVATE ${LIGHTGBM_LIB})
+    endif()
+endif()
+
+#===============================================================================
 # tests
 #===============================================================================
 add_executable(controller_test tests/controller_test.cpp)
-target_compile_options(controller_test PRIVATE -O3 -march=native -funroll-loops -flto -Wno-template-body)
+target_compile_options(controller_test PRIVATE -O3 -march=native -funroll-loops -flto)
 target_include_directories(controller_test PRIVATE ${CMAKE_SOURCE_DIR}/..)
 
 enable_testing()

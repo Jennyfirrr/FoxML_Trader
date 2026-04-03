@@ -147,6 +147,7 @@ struct ModelHandle {
     int backend;            // MODEL_BACKEND_NONE / XGBOOST / LIGHTGBM
     int num_features;       // expected input dimension
     char model_path[256];   // path for display/logging
+    char training_fingerprint[65]; // SHA256 of config+data used to train this model (empty if unknown)
 };
 
 //======================================================================================================
@@ -164,8 +165,25 @@ inline void Model_Init(ModelHandle<F> *m) {
 template <unsigned F>
 inline int Model_Load(ModelHandle<F> *m, const char *path, int backend) {
     Model_Init(m);
+    m->training_fingerprint[0] = '\0';
 
     if (!path || path[0] == '\0') return 0; // no path = disabled
+
+    // compute simple file checksum for logging (FNV-1a, fast and dependency-free)
+    // full SHA256 available via Fingerprint.hpp but would create circular include
+    {
+        FILE *cf = fopen(path, "rb");
+        if (cf) {
+            uint64_t hash = 14695981039346656037ULL; // FNV offset basis
+            uint8_t buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), cf)) > 0)
+                for (size_t i = 0; i < n; i++)
+                    hash = (hash ^ buf[i]) * 1099511628211ULL;
+            fclose(cf);
+            fprintf(stderr, "[ML] model checksum: %016lx (%s)\n", (unsigned long)hash, path);
+        }
+    }
 
     // stash path for logging
     strncpy(m->model_path, path, sizeof(m->model_path) - 1);
@@ -199,11 +217,20 @@ inline int Model_Load(ModelHandle<F> *m, const char *path, int backend) {
                 return 0;
             }
         }
+        // read training fingerprint (if embedded)
+        const char *fp = NULL;
+        int got_fp = XGBoosterGetAttr(booster, "foxml_fingerprint", &fp, (int[]){0});
+        if (got_fp == 0 && fp) {
+            strncpy(m->training_fingerprint, fp, 64);
+            m->training_fingerprint[64] = '\0';
+        }
         m->handle = (void*)booster;
         m->backend = MODEL_BACKEND_XGBOOST;
         m->num_features = MODEL_NUM_FEATURES;
-        fprintf(stderr, "[ML] XGBoost model loaded: %s (%d features, format v%d)\n",
-                path, m->num_features, MODEL_FORMAT_VERSION);
+        fprintf(stderr, "[ML] XGBoost model loaded: %s (%d features, format v%d%s%s)\n",
+                path, m->num_features, MODEL_FORMAT_VERSION,
+                m->training_fingerprint[0] ? ", fingerprint: " : "",
+                m->training_fingerprint[0] ? m->training_fingerprint : "");
         return 1;
     }
 #endif

@@ -101,17 +101,12 @@ static inline void GUI_Panel_Header(const TUISnapshot *s, uint64_t start_time) {
     ImGui::Text("%02u:%02u:%02u", hours, mins, secs);
 
     if (s->is_paused && s->gate_reason > 0) {
-        static const char *gate_reasons[] = {
-            "ok", "warmup", "no_signal", "no_trade", "book",
-            "danger", "kill", "recovery", "volatile", "cooldown",
-            "wind_down", "paused", "downtrend", "cost"
-        };
         int ri = (s->gate_reason >= 0 && s->gate_reason < NUM_GATE_REASONS) ? s->gate_reason : 0;
-        ImVec4 color = (ri == GATE_REASON_KILL || ri == GATE_REASON_DANGER) ? FoxmlColors::red : FoxmlColors::yellow;
+        ImVec4 color = GATE_REASON_TABLE[ri].is_danger ? FoxmlColors::red : FoxmlColors::yellow;
         ImGui::SameLine();
         ImGui::TextColored(FoxmlColors::comment, "|");
         ImGui::SameLine();
-        ImGui::TextColored(color, "PAUSED (%s)", gate_reasons[ri]);
+        ImGui::TextColored(color, "PAUSED (%s)", GATE_REASON_TABLE[ri].name);
     }
 
     if (s->current_session >= 0) {
@@ -122,40 +117,23 @@ static inline void GUI_Panel_Header(const TUISnapshot *s, uint64_t start_time) {
         ImGui::TextColored(FoxmlColors::sand, "%s (%.1fx)", sess_names[s->current_session], s->session_mult);
     }
 
-    // trading blocked indicator — detailed reason from gate_reason code
+    // trading blocked indicator — detailed reason from gate_reason table
     if (s->gate_reason > 0 && s->is_paused) {
-        ImVec4 hdr = (s->gate_reason == GATE_REASON_KILL || s->gate_reason == GATE_REASON_DANGER)
-                     ? FoxmlColors::red : FoxmlColors::yellow;
+        int ri = (s->gate_reason >= 0 && s->gate_reason < NUM_GATE_REASONS) ? s->gate_reason : 0;
+        ImVec4 hdr = GATE_REASON_TABLE[ri].is_danger ? FoxmlColors::red : FoxmlColors::yellow;
         ImGui::TextColored(hdr, "BUYING PAUSED");
         ImGui::SameLine();
-        switch (s->gate_reason) {
-        case GATE_REASON_WARMUP:
-            ImGui::TextColored(FoxmlColors::comment, "warmup — waiting for market data (%d/%d samples)",
-                              s->roll_count, s->min_warmup_samples); break;
-        case GATE_REASON_NO_SIGNAL:
-            ImGui::TextColored(FoxmlColors::comment, "no signal — strategy returned no buy price"); break;
-        case GATE_REASON_NO_TRADE:
-            ImGui::TextColored(FoxmlColors::comment, "no-trade band — signal too weak for fees"); break;
-        case GATE_REASON_BOOK:
-            ImGui::TextColored(FoxmlColors::comment, "book imbalance — insufficient bid pressure"); break;
-        case GATE_REASON_DANGER:
-            ImGui::TextColored(FoxmlColors::comment, "danger gradient — crash protection (score: %.0f%%)",
-                              s->danger_score * 100.0); break;
-        case GATE_REASON_KILL:
-            ImGui::TextColored(FoxmlColors::comment, "kill switch — max drawdown hit"); break;
-        case GATE_REASON_RECOVERY:
-            ImGui::TextColored(FoxmlColors::comment, "kill recovery — observation period"); break;
-        case GATE_REASON_VOLATILE:
-            ImGui::TextColored(FoxmlColors::comment, "volatile regime — buying paused"); break;
-        case GATE_REASON_COOLDOWN:
-            ImGui::TextColored(FoxmlColors::comment, "post-SL cooldown (%d cycles remaining)", s->sl_cooldown); break;
-        case GATE_REASON_WIND_DOWN:
-            ImGui::TextColored(FoxmlColors::comment, "session wind-down — closing time"); break;
-        case GATE_REASON_PAUSED:
-            ImGui::TextColored(FoxmlColors::comment, "manual pause"); break;
-        case GATE_REASON_DOWNTREND:
-            ImGui::TextColored(FoxmlColors::comment, "downtrend — buying paused"); break;
-        }
+        // 3 reasons have dynamic data — format them, rest use table description directly
+        char detail[128];
+        if (ri == GATE_REASON_WARMUP)
+            snprintf(detail, sizeof(detail), GATE_REASON_TABLE[ri].description, s->roll_count, s->min_warmup_samples);
+        else if (ri == GATE_REASON_DANGER)
+            snprintf(detail, sizeof(detail), GATE_REASON_TABLE[ri].description, s->danger_score * 100.0);
+        else if (ri == GATE_REASON_COOLDOWN)
+            snprintf(detail, sizeof(detail), GATE_REASON_TABLE[ri].description, s->sl_cooldown);
+        else
+            snprintf(detail, sizeof(detail), "%s", GATE_REASON_TABLE[ri].description);
+        ImGui::TextColored(FoxmlColors::comment, "%s", detail);
     }
 
     ImGui::End();
@@ -305,36 +283,36 @@ static inline void GUI_Panel_Market(const TUISnapshot *s) {
 
     // FoxML integration status (Phase 6C)
     {
-        int any_active = s->cost_gate_enabled | s->foxml_vol_scaling_enabled |
-                         s->confidence_enabled | s->bandit_enabled;
+        int any_active = s->ml.cost_gate_enabled | s->ml.foxml_vol_scaling_enabled |
+                         s->ml.confidence_enabled | s->ml.bandit_enabled;
         if (any_active) {
             ImGui::Separator();
             ImGui::TextColored(FoxmlColors::sand, "FoxML:");
-            if (s->cost_gate_enabled) {
+            if (s->ml.cost_gate_enabled) {
                 ImGui::SameLine(0, 10);
                 ImGui::TextColored(FoxmlColors::sand, "cost:");
                 ImGui::SameLine();
-                ImGui::Text("%.1f bps", s->cost_bps);
+                ImGui::Text("%.1f bps", s->ml.cost_bps);
             }
-            if (s->foxml_vol_scaling_enabled) {
+            if (s->ml.foxml_vol_scaling_enabled) {
                 ImGui::SameLine(0, 10);
                 ImGui::TextColored(FoxmlColors::sand, "vsz:");
                 ImGui::SameLine();
-                ImGui::Text("%.0f%%", s->foxml_vol_scale * 100.0);
+                ImGui::Text("%.0f%%", s->ml.foxml_vol_scale * 100.0);
             }
-            if (s->confidence_enabled) {
+            if (s->ml.confidence_enabled) {
                 ImGui::SameLine(0, 10);
                 ImGui::TextColored(FoxmlColors::sand, "conf:");
                 ImGui::SameLine();
-                ImGui::Text("%.2f", s->confidence);
+                ImGui::Text("%.2f", s->ml.confidence);
             }
-            if (s->bandit_enabled) {
+            if (s->ml.bandit_enabled) {
                 ImGui::SameLine(0, 10);
                 ImGui::TextColored(FoxmlColors::sand, "bandit:");
                 ImGui::SameLine();
-                ImVec4 bc = s->bandit_active ? FoxmlColors::green : FoxmlColors::comment;
+                ImVec4 bc = s->ml.bandit_active ? FoxmlColors::green : FoxmlColors::comment;
                 ImGui::TextColored(bc, "%.0f%% %s",
-                    s->bandit_blend * 100.0, s->bandit_active ? "ON" : "ramp");
+                    s->ml.bandit_blend * 100.0, s->ml.bandit_active ? "ON" : "ramp");
             }
         }
     }
@@ -380,13 +358,8 @@ static inline void GUI_Panel_BuyGate(const TUISnapshot *s) {
 
     ImGui::SameLine(0, 10);
     if (s->buy_p < 0.01) {
-        static const char *gate_short[] = {
-            "ok", "warmup", "no_signal", "no_trade", "book",
-            "danger", "kill", "recovery", "volatile", "cooldown",
-            "wind_down", "paused", "downtrend", "cost"
-        };
         int gi = (s->gate_reason >= 0 && s->gate_reason < NUM_GATE_REASONS) ? s->gate_reason : 0;
-        ImGui::TextColored(FoxmlColors::yellow, "GATE OFF (%s)", gate_short[gi]);
+        ImGui::TextColored(FoxmlColors::yellow, "GATE OFF (%s)", GATE_REASON_TABLE[gi].name);
     } else {
         int price_ok = s->gate_direction
             ? (s->price >= s->buy_p)
@@ -767,6 +740,107 @@ static inline void GUI_Panel_Latency(const TUISnapshot *s) {
 //==========================================================================
 // RENDER ALL DASHBOARD PANELS
 //==========================================================================
+//==========================================================================
+// PANEL: ML INTELLIGENCE — bandit arms, confidence, cost, model info
+//==========================================================================
+static inline void GUI_Panel_MLIntelligence(const TUISnapshot *s) {
+    int any_active = s->ml.cost_gate_enabled | s->ml.foxml_vol_scaling_enabled |
+                     s->ml.confidence_enabled | s->ml.bandit_enabled |
+                     s->ml.ml_model_loaded | s->ml.regime_model_loaded;
+    if (!any_active) return; // no ML features enabled — skip entirely
+
+    ImGui::Begin("ML Intelligence");
+
+    // Bandit Arms
+    if (s->ml.bandit_enabled && ImGui::CollapsingHeader("Bandit Arms", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextColored(FoxmlColors::sand, "Exp3-IX  |  %d steps  |  blend: %.0f%% %s",
+            s->ml.bandit_total_steps, s->ml.bandit_blend * 100.0,
+            s->ml.bandit_active ? "ON" : "ramp");
+        if (ImGui::BeginTable("bandit_arms", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("Arm");
+            ImGui::TableSetupColumn("Pulls");
+            ImGui::TableSetupColumn("Avg Reward");
+            ImGui::TableSetupColumn("Weight");
+            ImGui::TableSetupColumn("Prob");
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < 5; i++) {
+                if (s->ml.bandit_arm_names[i][0] == '\0') continue;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::Text("%s", s->ml.bandit_arm_names[i]);
+                ImGui::TableNextColumn(); ImGui::Text("%d", s->ml.bandit_pulls[i]);
+                ImGui::TableNextColumn();
+                ImVec4 rc = s->ml.bandit_avg_reward[i] >= 0 ? FoxmlColors::green : FoxmlColors::red;
+                ImGui::TextColored(rc, "%+.1f bps", s->ml.bandit_avg_reward[i]);
+                ImGui::TableNextColumn(); ImGui::Text("%.0f%%", s->ml.bandit_weights[i] * 100.0);
+                ImGui::TableNextColumn(); ImGui::Text("%.0f%%", s->ml.bandit_probs[i] * 100.0);
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    // Confidence Breakdown
+    if (s->ml.confidence_enabled && ImGui::CollapsingHeader("Confidence", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextColored(FoxmlColors::sand, "IC:");
+        ImGui::SameLine();
+        ImVec4 ic_c = (s->ml.confidence_ic > 0.1) ? FoxmlColors::green :
+                      (s->ml.confidence_ic > 0.0) ? FoxmlColors::yellow : FoxmlColors::red;
+        ImGui::TextColored(ic_c, "%.3f", s->ml.confidence_ic);
+        ImGui::SameLine(0, 15);
+        ImGui::TextColored(FoxmlColors::sand, "RMSE:");
+        ImGui::SameLine();
+        ImGui::Text("%.3f", s->ml.confidence_rmse);
+        ImGui::SameLine(0, 15);
+        ImGui::TextColored(FoxmlColors::sand, "Stability:");
+        ImGui::SameLine();
+        ImGui::Text("%.2f", s->ml.confidence_freshness);
+
+        // confidence bar
+        float conf_f = (float)s->ml.confidence;
+        ImVec4 bar_c = conf_f > 0.5f ? FoxmlColors::green : conf_f > 0.3f ? FoxmlColors::yellow : FoxmlColors::red;
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, bar_c);
+        ImGui::ProgressBar(conf_f, ImVec2(-1, 0), "");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0);
+        ImGui::Text("Combined: %.2f", s->ml.confidence);
+    }
+
+    // Cost Decomposition
+    if (s->ml.cost_gate_enabled && ImGui::CollapsingHeader("Cost Model", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextColored(FoxmlColors::sand, "Spread:"); ImGui::SameLine();
+        ImGui::Text("%.1f bps", s->ml.cost_spread);
+        ImGui::SameLine(0, 15);
+        ImGui::TextColored(FoxmlColors::sand, "Timing:"); ImGui::SameLine();
+        ImGui::Text("%.1f bps", s->ml.cost_timing);
+        ImGui::SameLine(0, 15);
+        ImGui::TextColored(FoxmlColors::sand, "Impact:"); ImGui::SameLine();
+        ImGui::Text("%.1f bps", s->ml.cost_impact);
+
+        ImGui::TextColored(FoxmlColors::sand, "Total:"); ImGui::SameLine();
+        ImVec4 tc = s->ml.cost_bps > 10.0 ? FoxmlColors::red : FoxmlColors::text;
+        ImGui::TextColored(tc, "%.1f bps", s->ml.cost_bps);
+        ImGui::SameLine(0, 15);
+        ImGui::TextColored(FoxmlColors::sand, "Breakeven:"); ImGui::SameLine();
+        ImGui::Text("%.1f bps", s->ml.cost_breakeven * 10000.0);
+    }
+
+    // Model Info
+    if ((s->ml.ml_model_loaded || s->ml.regime_model_loaded) &&
+        ImGui::CollapsingHeader("Models")) {
+        if (s->ml.ml_model_loaded) {
+            ImGui::TextColored(FoxmlColors::green, "Buy Signal:"); ImGui::SameLine();
+            ImGui::TextWrapped("%s", s->ml.ml_model_path);
+            ImGui::TextColored(FoxmlColors::sand, "Last prediction:"); ImGui::SameLine();
+            ImGui::Text("%.4f", s->ml.ml_last_prediction);
+        }
+        if (s->ml.regime_model_loaded) {
+            ImGui::TextColored(FoxmlColors::green, "Regime:"); ImGui::SameLine();
+            ImGui::TextWrapped("%s", s->ml.regime_model_path);
+        }
+    }
+
+    ImGui::End();
+}
+
 static inline void GUI_RenderDashboard(const TUISnapshot *s, uint64_t start_time) {
     GUI_Panel_Header(s, start_time);
     GUI_Panel_TopBar(s);
@@ -775,6 +849,7 @@ static inline void GUI_RenderDashboard(const TUISnapshot *s, uint64_t start_time
     GUI_Panel_Account(s);
     GUI_Panel_Positions(s);
     GUI_Panel_Stats(s);
+    GUI_Panel_MLIntelligence(s);
 #ifdef LATENCY_PROFILING
     GUI_Panel_Latency(s);
 #endif

@@ -29,18 +29,13 @@
 #include "../Strategies/MLStrategy.hpp"
 #include "../Strategies/RegimeDetector.hpp"
 #include "../ML_Headers/CostModel.hpp"
+#include "../ML_Headers/BarrierGate.hpp"
+#include "../ML_Headers/RewardTracker.hpp"
 #include "../ML_Headers/VolScaler.hpp"
 #include "../ML_Headers/ConfidenceScore.hpp"
 #include "../ML_Headers/BanditLearning.hpp"
 #if __has_include("../Strategies/private/EmaCross.hpp")
 #include "../Strategies/private/EmaCross.hpp"
-#else
-// stub types when EmaCross is not available (Clang template-body checking)
-template <unsigned F> struct EmaCrossState { int placeholder; };
-template <unsigned F> static inline void EmaCross_Init(EmaCrossState<F>*, void*, void*) {}
-template <unsigned F> static inline BuySideGateConditions<F> EmaCross_BuySignal(EmaCrossState<F>*, void*, void*, void*, FPN<F>) { return {}; }
-template <unsigned F> static inline void EmaCross_Adapt(EmaCrossState<F>*, FPN<F>, FPN<F>, uint16_t, void*, void*) {}
-template <unsigned F> static inline void EmaCross_ExitAdjust(void*, FPN<F>, void*, EmaCrossState<F>*, void*) {}
 #endif
 #include <stdio.h>
 #include <time.h>
@@ -72,7 +67,35 @@ static inline void log_ts(char *buf, size_t len) {
 #define GATE_REASON_PAUSED     11  // manual pause
 #define GATE_REASON_DOWNTREND  12  // downtrend regime
 #define GATE_REASON_COST       13  // cost gate (trade cost exceeds breakeven alpha)
-#define NUM_GATE_REASONS       14
+#define GATE_REASON_BARRIER    14  // barrier gate (peak probability too high)
+#define NUM_GATE_REASONS       15
+
+// centralized gate reason metadata — renderers look up name/description here.
+// add new gate reasons: one #define above + one row below.
+struct GateReasonDef {
+    const char *name;        // short label: "warmup", "kill"
+    const char *description; // detail text (may be printf format string for dynamic data)
+    int is_danger;           // 1 for KILL/DANGER (red color), 0 for others (yellow)
+};
+
+static const GateReasonDef GATE_REASON_TABLE[NUM_GATE_REASONS] = {
+    {"ok",         "",                                                  0},
+    {"warmup",     "warmup — waiting for market data (%d/%d samples)",  0},
+    {"no_signal",  "no signal — strategy returned no buy price",        0},
+    {"no_trade",   "no-trade band — signal too weak for fees",          0},
+    {"book",       "book imbalance — insufficient bid pressure",        0},
+    {"danger",     "danger gradient — crash protection (score: %.0f%%)", 1},
+    {"kill",       "kill switch — max drawdown hit",                    1},
+    {"recovery",   "kill recovery — observation period",                0},
+    {"volatile",   "volatile regime — buying paused",                   0},
+    {"cooldown",   "post-SL cooldown (%d cycles remaining)",            0},
+    {"wind_down",  "session wind-down — closing time",                  0},
+    {"paused",     "manual pause",                                      0},
+    {"downtrend",  "downtrend — buying paused",                         0},
+    {"cost",       "cost gate — trade cost > TP target",                0},
+    {"barrier",    "barrier gate — peak probability too high",           0},
+};
+
 //======================================================================================================
 template <unsigned F> struct PortfolioController {
   //================================================================================================
@@ -129,6 +152,7 @@ template <unsigned F> struct PortfolioController {
   uint32_t kill_recovery_counter;   // slow-path cycles remaining after kill reset before trading resumes
   double last_vol_scale;            // most recent vol scale factor applied (for TUI display)
   double last_cost_bps;             // most recent trade cost estimate in bps (for TUI display)
+  TradingCosts last_costs;          // full cost breakdown for ML Intelligence Panel
   double foxml_vol_scale;           // FoxML VolScaler output: inverse-vol position scale [0.1, 1.0]
   double last_confidence;           // most recent prediction confidence from ConfidenceScorer [0, 1]
   double entry_prediction[MAX_PORTFOLIO_POSITIONS]; // ML prediction at entry time (for confidence tracking)
@@ -159,6 +183,13 @@ template <unsigned F> struct PortfolioController {
 #endif
   RegimeState<F> regime;
   ModelHandle<F> regime_model;       // Mode A: regime signal enrichment model
+  ModelHandle<F> peak_model;         // barrier gate: P(will_peak) model
+  ModelHandle<F> valley_model;       // barrier gate: P(will_valley) model
+  RewardTracker reward_tracker;      // per-trade reward attribution for bandit analysis
+  // prediction z-score normalizer (Phase 7F)
+  uint64_t pred_norm_count;
+  double pred_norm_mean;
+  double pred_norm_m2;               // Welford M2 for variance
   RegimeSignals<F> last_signals;     // cached for ML strategy BuySignal access
 
   RORRegressor<F> regime_ror;  // slope-of-slopes for trend acceleration detection
@@ -172,6 +203,9 @@ template <unsigned F> struct PortfolioController {
   int current_session;          // 0=asian, 1=european, 2=us, 3=overnight
   FPN<F> session_mult;          // current session gate multiplier
   FPN<F> book_imbalance;        // bid/ask imbalance from depth stream [-1, +1] (updated externally)
+
+  time_t sim_time;              // simulated clock: live=time(NULL), backtest=tick timestamp
+                                // use this instead of time(NULL) for all time-dependent logic
 
   uint32_t idle_cycles;         // slow-path cycles since last fill (gate death spiral recovery)
   uint32_t fills_rejected;     // total fills rejected since startup
@@ -249,6 +283,15 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
   Model_Init(&ctrl->regime_model);
   if (config.regime_model_backend != 0)
     Model_Load(&ctrl->regime_model, config.regime_model_path, config.regime_model_backend);
+  // barrier gate models (peak/valley classifiers)
+  Model_Init(&ctrl->peak_model);
+  Model_Init(&ctrl->valley_model);
+  if (config.barrier_gate_enabled) {
+    if (config.peak_model_path[0])
+      Model_Load(&ctrl->peak_model, config.peak_model_path, config.ml_backend ? config.ml_backend : 1);
+    if (config.valley_model_path[0])
+      Model_Load(&ctrl->valley_model, config.valley_model_path, config.ml_backend ? config.ml_backend : 1);
+  }
   // regime detector
   Regime_Init(&ctrl->regime, config.regime_hysteresis);
   ctrl->regime_ror = RORRegressor_Init<F>();
@@ -275,6 +318,11 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
   ctrl->gate_reason = GATE_REASON_WARMUP;
   ctrl->last_vol_scale = 1.0;
   ctrl->last_cost_bps = 0.0;
+  memset(&ctrl->last_costs, 0, sizeof(ctrl->last_costs));
+  RewardTracker_Init(&ctrl->reward_tracker);
+  ctrl->pred_norm_count = 0;
+  ctrl->pred_norm_mean = 0.0;
+  ctrl->pred_norm_m2 = 0.0;
   ctrl->foxml_vol_scale = 1.0;
   ctrl->last_confidence = 0.0;
   for (int i = 0; i < MAX_PORTFOLIO_POSITIONS; i++)
@@ -305,7 +353,8 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
 
   ctrl->prev_bitmap = 0;
   ctrl->tick_count = 0;
-  ctrl->last_slow_time = (uint64_t)time(NULL);
+  ctrl->sim_time = time(NULL);  // default to wall clock, backtest overrides per-tick
+  ctrl->last_slow_time = (uint64_t)ctrl->sim_time;
   ctrl->total_ticks = 0;
 
   ctrl->state = CONTROLLER_WARMUP;
@@ -438,9 +487,22 @@ inline void RecordExit(PortfolioController<F> *ctrl, ExitRecord<F> *rec) {
 
     // win/loss counters: TP exit with positive P&L = win, everything else = loss
     // a TP exit where fees ate the profit is still a loss, not a win
+    //
+    // NOTE: paired positions (pair_index >= 0) count as separate wins/losses.
+    // total_buys counts each buy event (1 buy = 2 paired positions = 2 exits).
+    // trade count in stats = total_buys, not wins + losses.
     int is_profitable = !pos_pnl.sign & !FPN_IsZero(pos_pnl);
     ctrl->wins += ((reason == 0) & is_profitable);
     ctrl->losses += !((reason == 0) & is_profitable);
+
+    // reward attribution tracker: per-trade CSV for bandit analysis
+    {
+        double entry_d = FPN_ToDouble(rec->entry_price);
+        double exit_d = FPN_ToDouble(rec->exit_price);
+        double reward = (entry_d > 0.0) ? (exit_d - entry_d) / entry_d * 10000.0 : 0.0;
+        RewardTracker_Push(&ctrl->reward_tracker, strat, reward, entry_d, exit_d,
+                            ctrl->entry_ticks[slot], reason);
+    }
 
     // SL cooldown: adaptive or fixed, only on SL exits
     if (reason == 1) {
@@ -594,6 +656,23 @@ inline void PortfolioController_StrategyBuySignal(PortfolioController<F> *ctrl) 
                                             ctrl->rolling_long, (const void*)&ctrl->config,
                                             &ctrl->last_signals);
     ctrl->buy_conds.gate_direction = 0;
+    // prediction z-score normalization (Phase 7F)
+    if (ctrl->config.prediction_normalize && !FPN_IsZero(ctrl->ml_strategy.last_prediction)) {
+        double raw = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
+        ctrl->pred_norm_count++;
+        double delta = raw - ctrl->pred_norm_mean;
+        ctrl->pred_norm_mean += delta / (double)ctrl->pred_norm_count;
+        ctrl->pred_norm_m2 += delta * (raw - ctrl->pred_norm_mean);
+        // normalize after 100 predictions (enough for stable variance estimate)
+        if (ctrl->pred_norm_count >= 100) {
+            double variance = ctrl->pred_norm_m2 / (double)ctrl->pred_norm_count;
+            double stddev = (variance > 1e-15) ? sqrt(variance) : 1.0;
+            double z = (raw - ctrl->pred_norm_mean) / stddev;
+            // sigmoid transform: map z-score to [0, 1] for threshold comparison
+            double normalized = 1.0 / (1.0 + exp(-z));
+            ctrl->ml_strategy.last_prediction = FPN_FromDouble<F>(normalized);
+        }
+    }
     break;
   }
 
@@ -676,6 +755,8 @@ inline void PortfolioController_StrategyDispatch(PortfolioController<F> *ctrl,
     MLStrategy_Adapt(&ctrl->ml_strategy, current_price, ctrl->portfolio_delta,
                       ctrl->portfolio.active_bitmap, &ctrl->buy_conds,
                       (const void*)&ctrl->config);
+    MLStrategy_ExitAdjust(&ctrl->portfolio, current_price, &ctrl->rolling,
+                           &ctrl->ml_strategy, &ctrl->config);
     break;
   }
   PortfolioController_StrategyBuySignal(ctrl);
@@ -821,7 +902,7 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
     // represents a different point in time (real price diversity, not 128 copies
     // of the same second). tests use poll_interval=1 so every tick IS a sample.
     // time floor: also push if 3+ seconds have passed (low-volume periods)
-    uint64_t warmup_now = (uint64_t)time(NULL);
+    uint64_t warmup_now = (uint64_t)ctrl->sim_time;
     int warmup_time_floor = (warmup_now - ctrl->last_slow_time >= ctrl->config.slow_path_max_secs);
     if ((ctrl->warmup_count % ctrl->config.poll_interval == 0) || warmup_time_floor) {
       ctrl->last_slow_time = warmup_now;
@@ -1128,11 +1209,10 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
           ctrl->portfolio.positions[slot_a].pair_index = (int8_t)slot_b;
           ctrl->portfolio.positions[slot_b].pair_index = (int8_t)slot_a;
           // metadata for both slots
-          time_t now = time(NULL);
           ctrl->entry_ticks[slot_a] = ctrl->total_ticks;
           ctrl->entry_ticks[slot_b] = ctrl->total_ticks;
-          ctrl->entry_time[slot_a] = now;
-          ctrl->entry_time[slot_b] = now;
+          ctrl->entry_time[slot_a] = ctrl->sim_time;
+          ctrl->entry_time[slot_b] = ctrl->sim_time;
           ctrl->entry_strategy[slot_a] = (uint8_t)ctrl->strategy_id;
           ctrl->entry_strategy[slot_b] = (uint8_t)ctrl->strategy_id;
           ctrl->entry_prediction[slot_a] = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
@@ -1157,7 +1237,7 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
                                                   fill_price, tp_price, sl_price, entry_fee);
         if (slot >= 0) {
           ctrl->entry_ticks[slot] = ctrl->total_ticks;
-          ctrl->entry_time[slot] = time(NULL);
+          ctrl->entry_time[slot] = ctrl->sim_time;
           ctrl->entry_strategy[slot] = (uint8_t)ctrl->strategy_id;
           ctrl->entry_prediction[slot] = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
           ctrl->portfolio.positions[slot].original_tp = tp_price;
@@ -1225,12 +1305,12 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
   if (ctrl->tick_count < ctrl->config.poll_interval) {
     // time floor: check every 16 ticks to catch low-volume stalls (~0.3ns bitmask vs ~500ns syscall)
     if (ctrl->tick_count & 0xF) return;
-    uint64_t now = (uint64_t)time(NULL);
+    uint64_t now = (uint64_t)ctrl->sim_time;
     if (now - ctrl->last_slow_time < ctrl->config.slow_path_max_secs) return;
     // time floor hit — fall through to slow path
   }
   ctrl->tick_count = 0;
-  ctrl->last_slow_time = (uint64_t)time(NULL);
+  ctrl->last_slow_time = (uint64_t)ctrl->sim_time;
 
   // session awareness: classify UTC hour and set gate multiplier
   // reuses last_slow_time — no extra syscall
@@ -1247,6 +1327,10 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
   // drain exit buffer — books P&L, updates balance, logs trades
   if (ctrl->exit_buf.count > 0)
     PortfolioController_DrainExits(ctrl);
+
+  // drain reward attribution to CSV (append mode, ~1 write per trade)
+  if (ctrl->reward_tracker.count > 0)
+    RewardTracker_DrainCSV(&ctrl->reward_tracker, "logging/reward_attribution.csv");
 
   // TIME-BASED EXIT: close positions held too long with insufficient gain
   // frees capital trapped in positions where TP became unreachable (e.g. volatility
@@ -1396,9 +1480,9 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
     int new_regime = ctrl->regime.current_regime;
     if (new_regime != old_regime) {
       // compute duration before updating start time
-      double dur_min = difftime(time(NULL), ctrl->regime.regime_start_time) / 60.0;
+      double dur_min = difftime(ctrl->sim_time, ctrl->regime.regime_start_time) / 60.0;
       ctrl->regime.regime_start_tick = ctrl->total_ticks;
-      ctrl->regime.regime_start_time = time(NULL);
+      ctrl->regime.regime_start_time = ctrl->sim_time;
       {
         char ts[16]; log_ts(ts, sizeof(ts));
         static const char *rn[] = {"RANGING", "TRENDING", "VOLATILE", "DOWNTREND", "MILD_TREND"};
@@ -1517,12 +1601,29 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
     double adv = FPN_ToDouble(ctrl->rolling.volume_avg) * price_d; // ADV in quote currency
     TradingCosts tc = CostModel_EstimateDefault(spread_bps, vol, 5.0, order_sz,
                                                  (adv > 0.0) ? adv : 1.0);
+    ctrl->last_costs = tc;
     ctrl->last_cost_bps = tc.total_cost;
     double breakeven_bps = CostModel_Breakeven(tc.total_cost);
     double tp_bps = FPN_ToDouble(ctrl->config.take_profit_pct) * 10000.0;
     if (breakeven_bps > tp_bps) {
       Gate_Zero(&ctrl->buy_conds, 0);
       ctrl->gate_reason = GATE_REASON_COST;
+    }
+  }
+
+  // BARRIER GATE: block entries before predicted price peaks
+  // uses last_signals (already computed in regime detection above)
+  if (ctrl->config.barrier_gate_enabled && !FPN_IsZero(ctrl->buy_conds.price)
+      && Model_IsLoaded(&ctrl->peak_model)) {
+    float features[MODEL_MAX_FEATURES];
+    int n = ModelFeatures_Pack(features, &ctrl->last_signals, &ctrl->rolling, ctrl->rolling_long);
+    double p_peak = Model_Predict(&ctrl->peak_model, features, n);
+    double p_valley = Model_IsLoaded(&ctrl->valley_model)
+        ? Model_Predict(&ctrl->valley_model, features, n) : 0.5;
+    BarrierGateResult bg = BarrierGate_Compute(p_peak, p_valley);
+    if (bg.blocked) {
+      Gate_Zero(&ctrl->buy_conds, 0);
+      ctrl->gate_reason = GATE_REASON_BARRIER;
     }
   }
 
@@ -1667,7 +1768,7 @@ inline void PortfolioController_HotReload(PortfolioController<F> *ctrl,
 // v5 adds: entry_ticks, entry_strategy, strategy_id, regime, momentum state
 // backward compatible: v4/v5/v6 load gracefully (missing fields get defaults)
 //======================================================================================================
-#define CONTROLLER_SNAPSHOT_VERSION 10
+#define CONTROLLER_SNAPSHOT_VERSION 11
 
 template <unsigned F>
 inline void PortfolioController_SaveSnapshot(const PortfolioController<F> *ctrl,
@@ -1730,6 +1831,10 @@ inline void PortfolioController_SaveSnapshot(const PortfolioController<F> *ctrl,
     fwrite(&ctrl->strategy_stats[i].losses, sizeof(uint32_t), 1, f);
     fwrite(&ctrl->strategy_stats[i].total_trades, sizeof(uint32_t), 1, f);
   }
+
+  // v11: FoxML learned state (BanditState + ConfidenceScorer survive restarts)
+  fwrite(&ctrl->bandit, sizeof(BanditState), 1, f);
+  fwrite(&ctrl->confidence, sizeof(ConfidenceScorer), 1, f);
 
   fflush(f);
   fclose(f);
@@ -1840,6 +1945,14 @@ inline int PortfolioController_LoadSnapshot(PortfolioController<F> *ctrl,
       if (ctrl->kill_switch_active)
         fprintf(stderr, "[SNAPSHOT] kill switch ACTIVE (reason=%d) — trading halted. press 'k' to reset\n",
                 ctrl->kill_reason);
+    }
+
+    // v11: FoxML learned state (BanditState + ConfidenceScorer)
+    if (version >= 11) {
+      if (fread(&ctrl->bandit, sizeof(BanditState), 1, f) != 1) { fclose(f); return 0; }
+      if (fread(&ctrl->confidence, sizeof(ConfidenceScorer), 1, f) != 1) { fclose(f); return 0; }
+      fprintf(stderr, "[SNAPSHOT] restored bandit state (%d steps) + confidence scorer\n",
+              ctrl->bandit.total_steps);
     }
   }
 
