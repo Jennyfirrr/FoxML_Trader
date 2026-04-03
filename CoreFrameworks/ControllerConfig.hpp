@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Jennifer Lewis. All rights reserved.
-// Licensed under the MIT License. See LICENSE for details.
+// Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 // See LICENSE file in the project root for full license text.
 
 //======================================================================================================
@@ -111,6 +111,8 @@ template <unsigned F> struct ControllerConfig {
   FPN<F> partial_exit_pct;       // fraction to exit at TP1 (0.5 = 50%, rest rides TP2)
   FPN<F> tp2_mult;               // TP2 = TP1_distance * this (2.0 = double the TP distance)
   int breakeven_on_partial;      // 1 = move remaining SL to entry after TP1 hit
+  int breakeven_on_profit;       // 1 = ratchet SL to breakeven when position crosses net profit
+  FPN<F> breakeven_buffer_pct;   // SL offset from entry once breakeven ratchet fires (0.001 = +0.1% above entry, -0.001 = allow 0.1% loss)
   // slippage simulation
   FPN<F> slippage_pct;           // simulated slippage on entry/exit (e.g. 0.0005 = 0.05%)
   // session awareness
@@ -155,6 +157,16 @@ template <unsigned F> struct ControllerConfig {
   int danger_enabled;            // 0=disabled, 1=enabled
   FPN<F> danger_warn_stddevs;    // gradient starts at this many stddevs below avg (e.g. 3.0)
   FPN<F> danger_crash_stddevs;   // full gate kill at this many stddevs below avg (e.g. 6.0)
+  // tick recording (writes raw ticks to CSV for backtesting/ML training)
+  int record_ticks;              // 0=disabled (default), 1=record to data/{symbol}/YYYY-MM-DD.csv
+  uint32_t record_max_days;      // auto-prune CSVs older than this (default 30, ~2GB cap)
+  // FoxML integration — Phase 6C (all default OFF, zero behavior change when disabled)
+  int cost_gate_enabled;            // 0=disabled, 1=estimate trade cost via CostModel, suppress if unprofitable
+  int foxml_vol_scaling_enabled;    // 0=disabled, 1=scale risk_pct by VolScaler inverse-vol on slow path
+  FPN<F> foxml_vol_scaling_z_max;   // z-score clipping threshold for VolScaler (default 3.0)
+  int bandit_enabled;               // 0=disabled, 1=blend regime strategy with Exp3-IX bandit weights
+  FPN<F> bandit_blend_ratio;        // bandit influence fraction at full ramp (default 0.30)
+  int confidence_enabled;           // 0=disabled, 1=dynamic ml_buy_threshold from confidence scoring
 };
 //======================================================================================================
 template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
@@ -235,6 +247,8 @@ template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
   cfg.partial_exit_pct = FPN_FromDouble<F>(0.5);           // 50% at TP1, 50% rides
   cfg.tp2_mult = FPN_FromDouble<F>(2.0);                   // TP2 = 2x TP1 distance
   cfg.breakeven_on_partial = 1;                            // move SL to entry after TP1 hit
+  cfg.breakeven_on_profit = 0;                             // 0 = disabled, 1 = ratchet SL to breakeven on profit
+  cfg.breakeven_buffer_pct = FPN_FromDouble<F>(0.0005);    // +0.05% above entry (lock in tiny profit)
   cfg.slippage_pct = FPN_Zero<F>();                        // 0 = disabled (backward compat)
   cfg.session_filter_enabled = 0;                          // 0 = disabled (backward compat)
   cfg.session_asian_mult     = FPN_FromDouble<F>(1.5);     // wider gates in low-vol Asian session
@@ -274,6 +288,16 @@ template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
   cfg.danger_enabled = 1;
   cfg.danger_warn_stddevs = FPN_FromDouble<F>(3.0);    // gradient starts at 3σ below avg
   cfg.danger_crash_stddevs = FPN_FromDouble<F>(6.0);   // full gate kill at 6σ below avg
+  // tick recording (disabled by default — no disk usage unless explicitly enabled)
+  cfg.record_ticks = 0;
+  cfg.record_max_days = 30;
+  // FoxML integration — Phase 6C (all OFF by default, zero behavior change)
+  cfg.cost_gate_enabled = 0;
+  cfg.foxml_vol_scaling_enabled = 0;
+  cfg.foxml_vol_scaling_z_max = FPN_FromDouble<F>(3.0);
+  cfg.bandit_enabled = 0;
+  cfg.bandit_blend_ratio = FPN_FromDouble<F>(0.30);
+  cfg.confidence_enabled = 0;
   return cfg;
 }
 //======================================================================================================
@@ -432,6 +456,8 @@ inline ControllerConfig<F> ControllerConfig_Load(const char *filepath) {
     CFG_PARSE_INT(sl_cooldown_adaptive)
     CFG_PARSE_INT(partial_exit_enabled)
     CFG_PARSE_INT(breakeven_on_partial)
+    CFG_PARSE_INT(breakeven_on_profit)
+    CFG_PARSE_PCT(breakeven_buffer_pct)
     CFG_PARSE_INT(depth_enabled)
     CFG_PARSE_INT(use_real_money)
     CFG_PARSE_INT(session_filter_enabled)
@@ -455,6 +481,18 @@ inline ControllerConfig<F> ControllerConfig_Load(const char *filepath) {
     CFG_PARSE_INT(danger_enabled)
     CFG_PARSE_FPN(danger_warn_stddevs)
     CFG_PARSE_FPN(danger_crash_stddevs)
+
+    //--- tick recording ---
+    CFG_PARSE_INT(record_ticks)
+    CFG_PARSE_U32(record_max_days)
+
+    //--- FoxML integration (Phase 6C) ---
+    CFG_PARSE_INT(cost_gate_enabled)
+    CFG_PARSE_INT(foxml_vol_scaling_enabled)
+    CFG_PARSE_FPN(foxml_vol_scaling_z_max)
+    CFG_PARSE_INT(bandit_enabled)
+    CFG_PARSE_FPN(bandit_blend_ratio)
+    CFG_PARSE_INT(confidence_enabled)
 
     // ML model paths (string fields — not atof)
     if (strcmp(key, "ml_model_path") == 0) {

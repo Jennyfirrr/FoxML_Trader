@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # engine binary — ANSI TUI (zero deps, diff-based rendering)
 #===============================================================================
 add_executable(engine main.cpp)
-target_compile_options(engine PRIVATE -O3 -march=native -funroll-loops -flto)
+target_compile_options(engine PRIVATE -O3 -march=native -funroll-loops -flto -Wno-template-body)
 target_compile_definitions(engine PRIVATE MULTICORE_TUI USE_ANSI_TUI LICENSE_BYPASS)
 target_link_libraries(engine PRIVATE ssl crypto pthread)
 
@@ -90,7 +90,7 @@ if(USE_IMGUI_GUI)
     )
 
     add_executable(engine_gui main.cpp)
-    target_compile_options(engine_gui PRIVATE -O3 -march=native -funroll-loops -flto)
+    target_compile_options(engine_gui PRIVATE -O3 -march=native -funroll-loops -flto -Wno-template-body)
     target_compile_definitions(engine_gui PRIVATE
         MULTICORE_TUI USE_IMGUI_GUI LICENSE_BYPASS
     )
@@ -126,7 +126,7 @@ endif()
 # tests
 #===============================================================================
 add_executable(controller_test tests/controller_test.cpp)
-target_compile_options(controller_test PRIVATE -O3 -march=native -funroll-loops -flto)
+target_compile_options(controller_test PRIVATE -O3 -march=native -funroll-loops -flto -Wno-template-body)
 target_include_directories(controller_test PRIVATE ${CMAKE_SOURCE_DIR}/..)
 
 enable_testing()

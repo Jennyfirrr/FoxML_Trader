@@ -31,14 +31,14 @@
 #include "GUI/GuiThread.hpp"
 #endif
 
-#include "Licensing.hpp"
+// Licensing.hpp removed for open-source build (AGPL-3.0)
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <sys/stat.h>
 #ifdef LATENCY_PROFILING
 #include <x86intrin.h>
 #include <unistd.h>
-#include <sys/stat.h>
 #endif
 
 constexpr unsigned FP = 64;
@@ -131,18 +131,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    //==================================================================================================
-    // license check — before connecting to exchange
-    //==================================================================================================
-#ifndef LICENSE_BYPASS
-    LicenseInfo license;
-    if (!License_Validate(&license)) {
-        fprintf(stderr, "\n[ENGINE] license validation failed.\n");
-        fprintf(stderr, "[ENGINE] place your license key in ~/.foxml/license.key\n");
-        fprintf(stderr, "[ENGINE] get a key at https://foxml.dev\n\n");
-        return 1;
-    }
-#endif
+    // license check removed for open-source build
 
     //==================================================================================================
     // init stream

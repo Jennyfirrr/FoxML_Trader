@@ -120,12 +120,22 @@ static const CfgFieldDef field_defs[] = {
     {"danger_enabled",        "Enabled",      "Danger Gradient",  CFG_BOOL,  NULL},
     {"danger_warn_stddevs",   "Warn σ",       "Danger Gradient",  CFG_FLOAT, "%.1f"},
     {"danger_crash_stddevs",  "Crash σ",      "Danger Gradient",  CFG_FLOAT, "%.1f"},
+    // Tick Recording
+    {"record_ticks",          "Record Ticks", "Tick Recording",  CFG_BOOL,  NULL},
+    {"record_max_days",       "Max Days",     "Tick Recording",  CFG_FLOAT, "%.0f"},
     // Toggles
     {"use_real_money",        "LIVE Trading", "Toggles",         CFG_BOOL,  NULL},
     {"partial_exit_enabled",  "Partial Exits","Toggles",         CFG_BOOL,  NULL},
     {"session_filter_enabled","Session Filter","Toggles",        CFG_BOOL,  NULL},
     {"depth_enabled",         "Order Book",   "Toggles",         CFG_BOOL,  NULL},
     {"min_book_imbalance",    "Book Imbal",   "Toggles",         CFG_FLOAT, "%.2f"},
+    // FoxML integration (Phase 6C)
+    {"cost_gate_enabled",        "Cost Gate",         "FoxML",  CFG_BOOL,  NULL},
+    {"foxml_vol_scaling_enabled","Vol Scaling",        "FoxML",  CFG_BOOL,  NULL},
+    {"foxml_vol_scaling_z_max",  "Vol Z-Max",         "FoxML",  CFG_FLOAT, "%.1f"},
+    {"bandit_enabled",           "Bandit",            "FoxML",  CFG_BOOL,  NULL},
+    {"bandit_blend_ratio",       "Blend Ratio",       "FoxML",  CFG_FLOAT, "%.2f"},
+    {"confidence_enabled",       "Confidence",        "FoxML",  CFG_BOOL,  NULL},
 };
 static constexpr int NUM_FIELDS = sizeof(field_defs) / sizeof(field_defs[0]);
 
@@ -311,6 +321,11 @@ static inline void GUI_Panel_Settings(SettingsState *s, volatile sig_atomic_t *r
                 ImGui::SetItemTooltip("Danger gradient starts at this many σ below avg\n3.0 = gate begins tightening at 3σ drop");
             else if (strcmp(k, "danger_crash_stddevs") == 0)
                 ImGui::SetItemTooltip("Full gate kill at this many σ below avg\n6.0 = gate zeroed at 6σ drop (crash protection)");
+            // tick recording
+            else if (strcmp(k, "record_ticks") == 0)
+                ImGui::SetItemTooltip("Record raw ticks to CSV for backtesting/ML training\nOutput: data/{SYMBOL}/YYYY-MM-DD.csv\n~30-70MB/day for BTCUSDT");
+            else if (strcmp(k, "record_max_days") == 0)
+                ImGui::SetItemTooltip("Auto-delete tick CSVs older than this many days\n30 = ~1-2GB cap on disk usage");
             // regime detection
             else if (strcmp(k, "regime_crossover_threshold") == 0)
                 ImGui::SetItemTooltip("EMA/SMA spread for MILD_TREND (EMA Cross)\n0.0005 = 0.05%% gap (~$35 at BTC $68k)\nbelow = RANGING, above = mild uptrend");
@@ -369,6 +384,19 @@ static inline void GUI_Panel_Settings(SettingsState *s, volatile sig_atomic_t *r
                 ImGui::SetItemTooltip("How fast filters adapt to P&L regression\nhigher = more reactive to recent performance");
             else if (strcmp(k, "fee_floor_mult") == 0)
                 ImGui::SetItemTooltip("TP floor = entry * fee_rate * this\n3.0 = TP must clear round-trip fees + margin");
+            // FoxML integration (Phase 6C)
+            else if (strcmp(k, "cost_gate_enabled") == 0)
+                ImGui::SetItemTooltip("Suppress entries when estimated trade cost exceeds TP target\nuses spread + vol timing + market impact model");
+            else if (strcmp(k, "foxml_vol_scaling_enabled") == 0)
+                ImGui::SetItemTooltip("Scale position size inversely with volatility\nhigh vol = smaller position (consistent risk per trade)");
+            else if (strcmp(k, "foxml_vol_scaling_z_max") == 0)
+                ImGui::SetItemTooltip("Z-score clipping threshold for vol scaler\n3.0 = cap at 3 sigma (FoxML default)");
+            else if (strcmp(k, "bandit_enabled") == 0)
+                ImGui::SetItemTooltip("Blend regime strategy pick with Exp3-IX bandit weights\nlearns which strategies actually profit over time");
+            else if (strcmp(k, "bandit_blend_ratio") == 0)
+                ImGui::SetItemTooltip("Max bandit influence fraction (0.30 = 30%%)\nramps from 0%% to this over first 200 trades");
+            else if (strcmp(k, "confidence_enabled") == 0)
+                ImGui::SetItemTooltip("Dynamic ML threshold based on prediction quality\nraises threshold when IC/freshness/stability are low");
         }
     }
 
