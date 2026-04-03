@@ -1,11 +1,22 @@
 build/
 build_gui/
 build_latency/
+build_suite/
+build_suite_asan/
 vendor/
 logging/
 paper_runs/
+data/
+models/
 *.o
 *.d
 plans/
 .claude/
 .chart-venv/
+
+# NEVER push these
+engine.cfg
+backtest.cfg
+controller.cfg
+.env
+Strategies/private/
