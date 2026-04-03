@@ -1,12 +1,12 @@
 # FoxML Trader
 
-Tick-level crypto trading engine in C++. Branchless fixed-point arithmetic, bitmap-based portfolio management, regime detection with EMA/SMA crossover, and ML inference harness for XGBoost/LightGBM.
+Tick-level crypto trading engine + ML backtesting suite in C++. Branchless fixed-point arithmetic, bitmap-based portfolio management, regime detection with EMA/SMA crossover, and integrated XGBoost training pipeline.
 
 Built from scratch as a learning project — no frameworks, no black boxes.
 
-> **Note:** This project is actively developed using paper trading. Most features and updates are untested on live exchanges. Use at your own risk — this is a learning/research tool, not financial advice.
+> **Note:** This is a learning/research tool, not financial advice. Use at your own risk.
 >
-> **Roadmap:** Paper trading is the current focus — once bug-free, live exchange testing follows.
+> **v2.0.0-beta.1** — includes the new FoxML Suite (backtest + ML training). Previous stable: v1.3.0.
 
 ![FoxML Trader — chart + dashboard](assets/gui-overview.png)
 ![FoxML Trader — live trading](assets/gui-trading.png)
@@ -53,7 +53,20 @@ cmake --build build_gui
 cd build_gui && ./engine_gui
 ```
 
-### ML Inference Build
+### FoxML Suite (Backtest + ML Training)
+
+```bash
+# requires XGBoost C library (build from source — see DOCS/ML_USAGE.md)
+cmake -B build_suite -DUSE_IMGUI_GUI=ON -DUSE_XGBOOST=ON
+cmake --build build_suite --target foxml_suite
+cd build_suite && ln -s ../data data
+cp engine.cfg.example backtest.cfg    # edit for backtesting
+./foxml_suite
+```
+
+The suite replays historical tick data through the real engine, collects ML features, trains XGBoost models, and validates with walk-forward cross-validation. See [DOCS/ML_USAGE.md](DOCS/ML_USAGE.md) for the full workflow.
+
+### ML Inference Build (engine only)
 
 ```bash
 # XGBoost
@@ -83,7 +96,7 @@ The engine supports model-driven trading via XGBoost or LightGBM:
 - **Mode A — Regime Enrichment**: model prediction feeds into `RegimeSignals.model_score`, improving regime classification for all strategies
 - **Mode B — ML Strategy**: `STRATEGY_ML` (id=3) uses model predictions directly for buy signal generation
 
-Models are trained offline (Python), engine does inference only. Feature packing maps RegimeSignals + RollingStats fields to a float vector matching the training pipeline.
+Models can be trained in the FoxML Suite (C++ XGBoost, no Python needed) or offline. Feature packing maps RegimeSignals + RollingStats fields to a float vector — same code in training and inference.
 
 ```cfg
 ml_backend=1                    # 1=xgboost, 2=lightgbm
@@ -91,7 +104,7 @@ ml_model_path=models/buy.xgb
 ml_buy_threshold=0.60           # prediction > 0.6 = buy signal
 ```
 
-> **Note**: ML harness is wired and compiles clean, but is untested with real models. Inference paths are no-ops when `ml_backend=0` (default).
+> Models are trained in the FoxML Suite with walk-forward validation and overfitting detection. Inference paths are no-ops when `ml_backend=0` (default).
 
 ## Configuration
 
@@ -119,7 +132,8 @@ ML_Headers/       - RollingStats, ModelInference (XGBoost/LightGBM), WelfordStat
 DataStream/       - BinanceCrypto (websocket), EngineTUI (snapshot), TUIAnsi (renderer)
 FixedPoint/       - FPN arbitrary-width fixed-point arithmetic library
 GUI/              - Dear ImGui panels (dashboard, chart, settings, trade history, log)
-tests/            - controller_test.cpp (245 assertions)
+Backtest/         - BacktestEngine (replay), BacktestPanels (suite GUI), LabelFunctions (ML targets)
+tests/            - controller_test.cpp
 ```
 
 ## Platform Support
