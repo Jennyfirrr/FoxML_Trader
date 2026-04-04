@@ -5,8 +5,6 @@ Tick-level crypto trading engine + ML backtesting suite in C++. Branchless fixed
 Built from scratch as a learning project — no frameworks, no black boxes.
 
 > **Note:** This is a learning/research tool, not financial advice. Use at your own risk.
->
-> **v2.0.0-beta.1** — includes the new FoxML Suite (backtest + ML training). Previous stable: v1.3.0.
 
 ![FoxML Trader — chart + dashboard](assets/gui-overview.png)
 ![FoxML Trader — live trading](assets/gui-trading.png)
@@ -14,22 +12,45 @@ Built from scratch as a learning project — no frameworks, no black boxes.
 
 ## Features
 
+### Execution Engine
 - **Tick-level execution**: every market tick processed in <100ns on hot path
-- **Fixed-point arithmetic**: deterministic 128-bit FPN — no floating-point rounding variance
-- **Branchless hot path**: mask-select patterns eliminate branch misprediction
-- **Regime detection**: EMA/SMA crossover with score-based classification (RANGING / TRENDING / VOLATILE)
-- **5 strategies**: Mean Reversion, Momentum, SimpleDip, EMA Cross, ML (model-driven)
-- **ML inference harness**: XGBoost / LightGBM C API integration (~1-5us per prediction)
-- **Risk infrastructure**: sticky kill switch, vol-scaled sizing, no-trade band, per-strategy P&L attribution
-- **Native GUI**: Dear ImGui + implot (SDL2/OpenGL3) — dockable panels, candlestick charts, live settings editor
-- **ANSI TUI**: zero-dependency terminal dashboard with diff-based rendering
+- **Fixed-point arithmetic**: 4096-bit FPN (64 words) — no floating-point rounding in any accounting path
+- **Branchless hot path**: mask-select patterns eliminate branch misprediction on buy gate + exit gate
+- **Bitmap portfolio**: `uint16_t` active bitmap — O(popcount) position walks, no linked lists
 - **Live trading**: Binance websocket (market data) + REST API (orders)
 - **Paper trading**: full simulation with configurable fees, slippage, and balance
+
+### Strategies & Regime Detection
+- **Regime detection**: EMA/SMA crossover with score-based classification (RANGING / TRENDING / TRENDING_DOWN / VOLATILE / MILD_TREND)
+- **4 strategies**: Mean Reversion, Momentum, SimpleDip, ML (model-driven) — extensible via StrategyInterface
+- **Adaptive gates**: P&L regression shifts entry filters — winning = widen, losing = tighten
+- **Trailing TP/SL**: R²-scaled exit adjustment for momentum positions
+
+### Risk Management
+- **Sticky kill switch**: daily loss or drawdown limit breach halts buying until session reset
+- **Vol-scaled sizing**: position quantity scales inversely with volatility
+- **No-trade band**: suppresses entries when signal strength < fee breakeven
+- **SL floor invariant**: stop-loss can never be closer than half the TP distance
+- **24-hour session lifecycle**: warmup → trade → wind down → close all → reconnect
+
+### FoxML Suite (Backtest + ML Training)
+- **Tick-accurate replay**: runs the real engine on historical data (same code path as live)
+- **ML feature collection**: packs RollingStats + RegimeSignals into feature vectors
+- **XGBoost training**: train models in C++ — no Python needed
+- **Walk-forward validation**: purged temporal CV with overfitting detection
+- **Barrier labels**: TP/SL barrier hit labeling with neutral filtering
+- **Overfitting detection**: per-fold memorization checks (train accuracy, gap analysis)
+- **Optimizer**: grid search over config parameters with metric comparison
+
+### Interface
+- **Native GUI**: Dear ImGui + implot (SDL2/OpenGL3) — dockable panels, candlestick charts, live settings editor with tooltips
+- **ANSI TUI**: zero-dependency terminal dashboard with diff-based rendering
+- **68 hot-reloadable config fields**: edit engine.cfg while running, press `r` to reload
 
 ## Quick Start
 
 ```bash
-# clone and build (ANSI TUI, only needs OpenSSL)
+# clone and build (ANSI TUI — zero dependencies)
 git clone https://github.com/Jennyfirrr/FoxML_Trader.git
 cd FoxML_Trader
 cmake -B build && cmake --build build
@@ -40,7 +61,7 @@ cp engine.cfg.example engine.cfg    # edit with your settings
 # run
 cd build && ./engine
 
-# run tests (245 assertions)
+# run tests
 ./build/controller_test
 ```
 
@@ -56,24 +77,23 @@ cd build_gui && ./engine_gui
 ### FoxML Suite (Backtest + ML Training)
 
 ```bash
-# requires XGBoost C library (build from source — see DOCS/ML_USAGE.md)
+# requires XGBoost C library (see below)
 cmake -B build_suite -DUSE_IMGUI_GUI=ON -DUSE_XGBOOST=ON
 cmake --build build_suite --target foxml_suite
 cd build_suite && ln -s ../data data
-cp engine.cfg.example backtest.cfg    # edit for backtesting
+cp engine.cfg.example backtest.cfg
 ./foxml_suite
 ```
 
 The suite replays historical tick data through the real engine, collects ML features, trains XGBoost models, and validates with walk-forward cross-validation. See [DOCS/ML_USAGE.md](DOCS/ML_USAGE.md) for the full workflow.
 
-### ML Inference Build (engine only)
+#### XGBoost C Library (build from source)
 
 ```bash
-# XGBoost
-cmake -B build -DUSE_XGBOOST=ON && cmake --build build
-
-# LightGBM
-cmake -B build -DUSE_LIGHTGBM=ON && cmake --build build
+git clone --recurse-submodules https://github.com/dmlc/xgboost.git /tmp/xgboost
+cd /tmp/xgboost && mkdir build && cd build
+cmake .. -DBUILD_STATIC_LIB=OFF && make -j$(nproc)
+sudo make install && sudo ldconfig
 ```
 
 ## Architecture
@@ -82,76 +102,51 @@ cmake -B build -DUSE_LIGHTGBM=ON && cmake --build build
 HOT PATH (every tick, <100ns):
   BuyGate (branchless) -> OrderPool
   PositionExitGate (branchless bitmap walk) -> ExitBuffer
+  Fill consumption (every tick — zero unprotected exposure)
 
 SLOW PATH (every N ticks):
-  RollingStats -> RegimeDetector -> Strategy dispatch
-  ML inference (if enabled) -> model_score enrichment
-  Portfolio P&L -> adaptive gate adjustment
+  RollingStats (least-squares regression, VWAP, R²)
+  RegimeDetector (EMA/SMA crossover → score-based classify)
+  Strategy dispatch → adaptive gate adjustment
+  ML inference (if enabled) → model_score → buy signal
 ```
-
-## ML Inference Harness
-
-The engine supports model-driven trading via XGBoost or LightGBM:
-
-- **Mode A — Regime Enrichment**: model prediction feeds into `RegimeSignals.model_score`, improving regime classification for all strategies
-- **Mode B — ML Strategy**: `STRATEGY_ML` (id=3) uses model predictions directly for buy signal generation
-
-Models can be trained in the FoxML Suite (C++ XGBoost, no Python needed) or offline. Feature packing maps RegimeSignals + RollingStats fields to a float vector — same code in training and inference.
-
-```cfg
-ml_backend=1                    # 1=xgboost, 2=lightgbm
-ml_model_path=models/buy.xgb
-ml_buy_threshold=0.60           # prediction > 0.6 = buy signal
-```
-
-> Models are trained in the FoxML Suite with walk-forward validation and overfitting detection. Inference paths are no-ops when `ml_backend=0` (default).
-
-## Configuration
-
-Copy `engine.cfg.example` to `engine.cfg` and edit. All parameters are hot-reloadable — press `r` in the TUI or edit the file while running.
-
-Key sections: Trading, Entry Filters, Risk Management, Kill Switch, Vol Sizing, No-Trade Band, Regime Detection, ML Inference, Session Filters.
-
-The GUI settings panel exposes all ~68 config fields with hover tooltips.
-
-## Risk Infrastructure
-
-- **Sticky kill switch**: daily loss or drawdown limit breach halts all buying until session reset or manual `k` key. Persists across crashes (snapshot v10).
-- **Centralized state mutations**: `KillSwitch_Activate/Reset`, `Buying_Halt`, `RecordExit` — all safety-critical transitions go through single-site functions
-- **Cache-optimal struct layout**: hot-path fields packed into 4 cache lines (256 bytes), cold data pushed to end
-- **Vol-scaled sizing**: position quantity scales inversely with volatility (consistent risk per trade)
-- **No-trade band**: suppresses entries when signal strength < fee breakeven (prevents churn)
-- **Per-strategy P&L**: tracks wins/losses/P&L per strategy for comparison
 
 ## Project Structure
 
 ```
-CoreFrameworks/   - OrderGates, Portfolio (bitmap), PortfolioController (feedback loop)
-Strategies/       - RegimeDetector, MeanReversion, Momentum, SimpleDip, MLStrategy
-ML_Headers/       - RollingStats, ModelInference (XGBoost/LightGBM), WelfordStats
-DataStream/       - BinanceCrypto (websocket), EngineTUI (snapshot), TUIAnsi (renderer)
-FixedPoint/       - FPN arbitrary-width fixed-point arithmetic library
-GUI/              - Dear ImGui panels (dashboard, chart, settings, trade history, log)
-Backtest/         - BacktestEngine (replay), BacktestPanels (suite GUI), LabelFunctions (ML targets)
-tests/            - controller_test.cpp
+CoreFrameworks/   OrderGates, Portfolio (bitmap), PortfolioController (feedback loop)
+Strategies/       RegimeDetector, MeanReversion, Momentum, SimpleDip, MLStrategy
+ML_Headers/       RollingStats, ModelInference, BanditLearning, CostModel, VolScaler
+DataStream/       BinanceCrypto (websocket), EngineTUI (snapshot), TUIAnsi (renderer)
+FixedPoint/       FPN arbitrary-width fixed-point arithmetic library
+GUI/              Dear ImGui panels (dashboard, chart, settings, trade history, log)
+Backtest/         BacktestEngine, BacktestPanels (suite GUI), LabelFunctions, ValidationSplit, OverfitDetection
+tests/            controller_test.cpp
 ```
-
-## Platform Support
-
-- **Linux**: fully tested (Arch, Ubuntu)
-- **Windows**: use WSL2 (native Windows not supported)
-- **macOS**: should work, untested — install deps via Homebrew
 
 ## Build Options
 
 | Flag | Description |
 |------|-------------|
-| `-DUSE_IMGUI_GUI=ON` | Build native GUI (requires SDL2 + OpenGL) — **default** |
-| `-DUSE_NATIVE_128=ON` | Use native `__uint128_t` FPN (faster comparisons) — **default** |
-| `-DUSE_XGBOOST=ON` | Link XGBoost C API for ML inference |
-| `-DUSE_LIGHTGBM=ON` | Link LightGBM C API for ML inference |
-| `-DLATENCY_PROFILING=ON` | Enable RDTSCP latency profiling |
-| `-DBUSY_POLL=ON` | Spin-poll instead of sleeping (lower latency, higher CPU) |
+| `-DUSE_IMGUI_GUI=ON` | Native GUI (requires SDL2 + OpenGL) |
+| `-DUSE_NATIVE_128=ON` | Native `__uint128_t` FPN (default) |
+| `-DUSE_XGBOOST=ON` | XGBoost C API for ML training + inference |
+| `-DUSE_LIGHTGBM=ON` | LightGBM C API for ML inference |
+| `-DLATENCY_PROFILING=ON` | RDTSCP latency profiling |
+| `-DBUSY_POLL=ON` | Spin-poll (lower latency, higher CPU) |
+
+## Configuration
+
+Copy `engine.cfg.example` to `engine.cfg` and edit. All parameters are hot-reloadable.
+
+```cfg
+# example: ML-driven trading
+ml_backend=1                    # 1=xgboost, 2=lightgbm
+ml_model_path=models/buy.xgb
+ml_buy_threshold=0.60           # prediction > 0.6 = buy signal
+```
+
+The GUI settings panel exposes all config fields with hover tooltips.
 
 ## TUI Controls
 
@@ -159,11 +154,17 @@ tests/            - controller_test.cpp
 |-----|--------|
 | `q` | Quit |
 | `p` | Pause/unpause buying |
-| `r` | Hot-reload config from engine.cfg |
+| `r` | Hot-reload config |
 | `s` | Cycle regime (manual override) |
 | `k` | Reset kill switch |
 | `l` | Cycle TUI layout |
 
+## Platform Support
+
+- **Linux**: fully tested (Arch, Ubuntu)
+- **Windows**: WSL2
+- **macOS**: untested — deps via Homebrew
+
 ## License
 
-MIT — see [LICENSE](LICENSE)
+AGPL-3.0 — see [LICENSE](LICENSE)
