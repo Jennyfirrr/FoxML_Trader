@@ -61,11 +61,9 @@ inline BuySideGateConditions<F> SimpleDip_BuySignal(
 
     BuySideGateConditions<F> conds;
 
-    // update recent high from rolling stats
-    // use the higher of short and long window max for a broader view
-    state->recent_high = rolling->price_max;
-    if (rolling_long && FPN_GreaterThan(rolling_long->price_max, state->recent_high))
-        state->recent_high = rolling_long->price_max;
+    // anchor on rolling average — adjusts continuously, no ratcheting decay
+    // (price_max ratchets up in trends and stays unreachable for the full window duration)
+    state->recent_high = rolling->price_avg;
 
     // buy price = recent_high * (1 - dip_pct)
     // dip_pct comes from entry_offset_pct (reuse existing config field)

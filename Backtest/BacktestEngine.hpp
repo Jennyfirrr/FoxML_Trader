@@ -104,7 +104,7 @@ static inline int BacktestData_Load(HistoricalTick *ticks, int *count, int max_t
 // [RUN CONFIG]
 //======================================================================================================
 struct BacktestRunConfig {
-    char data_paths[16][256];
+    char data_paths[MAX_DATA_FILES][256];
     int num_data_files;
     char config_path[256];
     ControllerConfig<BACKTEST_FP> config_override;
@@ -135,13 +135,16 @@ struct BacktestStats {
     double avg_hold_ticks;
     double elapsed_ms;
     uint64_t ticks_processed;
+    // gate reason breakdown (why the engine isn't trading)
+    int gate_counts[NUM_GATE_REASONS];
+    int total_slow_cycles;
 };
 
 //======================================================================================================
 // [RESULTS]
 //======================================================================================================
 #define BACKTEST_MAX_EQUITY    8192
-#define BACKTEST_MAX_SAMPLES   500000
+#define BACKTEST_SAMPLES_INIT  500000  // initial allocation, grows as needed
 #define BACKTEST_TRADE_CSV     "logging/BACKTEST_order_history.csv"
 
 struct BacktestResults {
@@ -149,16 +152,66 @@ struct BacktestResults {
     double equity_curve[BACKTEST_MAX_EQUITY];
     int equity_count;
     char trade_csv_path[256];
-    // ML features (populated when collect_features=1)
-    float feature_matrix[BACKTEST_MAX_SAMPLES * MODEL_MAX_FEATURES];
-    float labels[BACKTEST_MAX_SAMPLES];
-    int sample_tick_indices[BACKTEST_MAX_SAMPLES]; // tick index of each sample (for label computation)
-    double sample_prices[BACKTEST_MAX_SAMPLES];     // price at each sample point
-    int sample_regimes[BACKTEST_MAX_SAMPLES];       // regime at each sample point
+    // ML features (dynamically allocated, grows as needed)
+    float *feature_matrix;   // [sample_capacity * MODEL_MAX_FEATURES]
+    float *labels;           // [sample_capacity]
+    int   *sample_tick_indices; // tick index of each sample (for label computation)
+    double *sample_prices;     // price at each sample point
+    int   *sample_regimes;     // regime at each sample point
     int sample_count;
+    int sample_capacity;       // current allocation size
     // config used (for comparison)
     ControllerConfig<BACKTEST_FP> config_used;
 };
+
+static inline void BacktestResults_Init(BacktestResults *r) {
+    memset(r, 0, sizeof(*r));
+    r->sample_capacity = BACKTEST_SAMPLES_INIT;
+    r->feature_matrix      = (float *)malloc(r->sample_capacity * MODEL_MAX_FEATURES * sizeof(float));
+    r->labels              = (float *)malloc(r->sample_capacity * sizeof(float));
+    r->sample_tick_indices = (int *)malloc(r->sample_capacity * sizeof(int));
+    r->sample_prices       = (double *)malloc(r->sample_capacity * sizeof(double));
+    r->sample_regimes      = (int *)malloc(r->sample_capacity * sizeof(int));
+}
+
+static inline void BacktestResults_Free(BacktestResults *r) {
+    free(r->feature_matrix);
+    free(r->labels);
+    free(r->sample_tick_indices);
+    free(r->sample_prices);
+    free(r->sample_regimes);
+    r->feature_matrix = NULL;
+    r->labels = NULL;
+    r->sample_tick_indices = NULL;
+    r->sample_prices = NULL;
+    r->sample_regimes = NULL;
+    r->sample_count = 0;
+    r->sample_capacity = 0;
+}
+
+// grow sample buffers by 2x when full
+static inline int BacktestResults_EnsureCapacity(BacktestResults *r, int needed) {
+    if (needed <= r->sample_capacity) return 1;
+    int new_cap = r->sample_capacity * 2;
+    while (new_cap < needed) new_cap *= 2;
+    float *fm  = (float *)realloc(r->feature_matrix, new_cap * MODEL_MAX_FEATURES * sizeof(float));
+    float *lb  = (float *)realloc(r->labels, new_cap * sizeof(float));
+    int   *ti  = (int *)realloc(r->sample_tick_indices, new_cap * sizeof(int));
+    double *sp = (double *)realloc(r->sample_prices, new_cap * sizeof(double));
+    int   *sr  = (int *)realloc(r->sample_regimes, new_cap * sizeof(int));
+    if (!fm || !lb || !ti || !sp || !sr) {
+        fprintf(stderr, "[backtest] failed to grow sample buffers to %d (%.0f MB)\n",
+                new_cap, new_cap * (MODEL_MAX_FEATURES * 4.0 + 4 + 4 + 8 + 4) / 1e6);
+        return 0; // keep old pointers, caller should stop collecting
+    }
+    r->feature_matrix = fm;
+    r->labels = lb;
+    r->sample_tick_indices = ti;
+    r->sample_prices = sp;
+    r->sample_regimes = sr;
+    r->sample_capacity = new_cap;
+    return 1;
+}
 
 //======================================================================================================
 // [STATS COMPUTE]
@@ -254,7 +307,22 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
                                  volatile int *progress_pct, volatile int *cancel_flag,
                                  CandleAccumulator *candle_acc,
                                  TUISnapshot *out_snapshot = NULL) {
-    memset(results, 0, sizeof(*results));
+    // reset results — preserve dynamic allocations, just reset counts
+    {
+        float *fm = results->feature_matrix;
+        float *lb = results->labels;
+        int   *ti = results->sample_tick_indices;
+        double *sp = results->sample_prices;
+        int   *sr = results->sample_regimes;
+        int cap = results->sample_capacity;
+        memset(results, 0, sizeof(*results));
+        results->feature_matrix = fm;
+        results->labels = lb;
+        results->sample_tick_indices = ti;
+        results->sample_prices = sp;
+        results->sample_regimes = sr;
+        results->sample_capacity = cap;
+    }
 
     // load config
     ControllerConfig<BACKTEST_FP> cfg;
@@ -277,6 +345,10 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
     ctrl.sim_time = 0;          // will be set from first tick timestamp
     ctrl.last_slow_time = 0;    // triggers time seed on first tick
 
+    // gate reason diagnostics — count slow-path cycles per gate reason
+    int gate_counts[NUM_GATE_REASONS] = {};
+    int total_slow_cycles = 0;
+
     // init order pool (same as main.cpp:174)
     OrderPool<BACKTEST_FP> pool;
     OrderPool_init(&pool, 64);
@@ -291,21 +363,15 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
     TradeLog_Init(&log, "BACKTEST");
 
     // load all data files
-    // allocate on heap — tick data can be large (~40MB per day)
-    int max_ticks = 2000000; // 2M ticks per file
-    HistoricalTick *ticks = (HistoricalTick *)malloc(max_ticks * sizeof(HistoricalTick));
-    if (!ticks) {
-        fprintf(stderr, "[backtest] failed to allocate tick buffer\n");
-        return;
-    }
-
     struct timeval t_start, t_end;
     gettimeofday(&t_start, NULL);
 
     int total_processed = 0;
     int total_ticks_all_files = 0;
 
-    // first pass: count total ticks for progress bar
+    // first pass: count total ticks per file for progress bar + allocation
+    int *file_tick_counts = (int *)calloc(run_cfg->num_data_files, sizeof(int));
+    int max_ticks_in_file = 0;
     for (int f = 0; f < run_cfg->num_data_files; f++) {
         FILE *fp = fopen(run_cfg->data_paths[f], "r");
         if (!fp) continue;
@@ -313,15 +379,48 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
         char buf[512];
         while (fgets(buf, sizeof(buf), fp)) lines++;
         fclose(fp);
-        total_ticks_all_files += lines - 1; // subtract header
+        file_tick_counts[f] = lines - 1; // subtract header
+        total_ticks_all_files += file_tick_counts[f];
+        if (file_tick_counts[f] > max_ticks_in_file)
+            max_ticks_in_file = file_tick_counts[f];
     }
     if (total_ticks_all_files <= 0) total_ticks_all_files = 1; // avoid div by zero
+
+    // allocate tick buffer sized to 2x largest file (current + next for label lookahead)
+    int max_ticks = 2 * max_ticks_in_file + 1024;
+    if (max_ticks < 1024) max_ticks = 1024;
+    HistoricalTick *ticks = (HistoricalTick *)malloc(max_ticks * sizeof(HistoricalTick));
+    if (!ticks) {
+        fprintf(stderr, "[backtest] failed to allocate tick buffer (%d ticks, %.0f MB)\n",
+                max_ticks, max_ticks * sizeof(HistoricalTick) / 1e6);
+        free(file_tick_counts);
+        return;
+    }
+    fprintf(stderr, "[backtest] tick buffer: %d ticks (%.0f MB) for %d files\n",
+            max_ticks, max_ticks * sizeof(HistoricalTick) / 1e6, run_cfg->num_data_files);
 
     double price_d_last = 0.0; // track last price for snapshot
     int64_t last_day_ms = 0;  // day boundary detection (ms timestamp of last midnight)
 
+    // resolve label function + params before file loop (used per-file after replay)
+    LabelFn label_fn = NULL;
+    if (run_cfg->collect_features) {
+        for (int l = 0; l < LABEL_COUNT; l++) {
+            if (label_table[l].id == run_cfg->label_type) {
+                label_fn = label_table[l].fn;
+                break;
+            }
+        }
+        if (!label_fn) label_fn = Label_WinLoss;
+    }
+    double label_tp = run_cfg->label_tp_pct > 0 ? run_cfg->label_tp_pct : 1.5;
+    double label_sl = run_cfg->label_sl_pct > 0 ? run_cfg->label_sl_pct : 1.0;
+    int label_fwd = run_cfg->label_forward_ticks > 0 ? run_cfg->label_forward_ticks : 1000;
+
     // replay each file
     for (int f = 0; f < run_cfg->num_data_files; f++) {
+        int file_tick_offset = total_processed;       // global index where this file starts
+        int file_sample_start = results->sample_count; // sample index where this file starts
         int count = 0;
         if (!BacktestData_Load(ticks, &count, max_ticks, run_cfg->data_paths[f]))
             continue;
@@ -424,10 +523,12 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
                                      &log, tick.is_buyer_maker);
 
             // feed candle accumulator for chart (with historical timestamps)
-            if (candle_acc)
+            // throttle to every 100th tick — 1-min candles don't need every tick,
+            // and unthrottled mutex contention (237M locks) freezes the GUI thread
+            if (candle_acc && (total_processed % 100) == 0)
                 CandleAccumulator_PushWithTime(candle_acc, tick.price_d, tick.volume_d,
                                                tick.is_buyer_maker,
-                                               (double)(ticks[i].timestamp_us / 1000));
+                                               (double)(ticks[i].timestamp_us / 1000000));
 
             // track equity curve (on each trade completion)
             if (ctrl.total_buys > 0 && (ctrl.wins + ctrl.losses) > (uint32_t)results->equity_count) {
@@ -443,8 +544,8 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
             // labels are computed in a post-processing pass after replay
             // (they need forward-looking data that hasn't been seen yet)
             if (run_cfg->collect_features && ctrl.tick_count == 0 &&
-                results->sample_count < BACKTEST_MAX_SAMPLES &&
-                ctrl.state != CONTROLLER_WARMUP) {
+                ctrl.state != CONTROLLER_WARMUP &&
+                BacktestResults_EnsureCapacity(results, results->sample_count + 1)) {
                 ModelFeatures_Pack<BACKTEST_FP>(
                     &results->feature_matrix[results->sample_count * MODEL_NUM_FEATURES],
                     &ctrl.last_signals,
@@ -457,10 +558,41 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
                 results->sample_count++;
             }
 
+            // gate reason diagnostics (every slow-path cycle)
+            if (ctrl.tick_count == 0 && ctrl.state != CONTROLLER_WARMUP) {
+                int gr = ctrl.gate_reason;
+                if (gr >= 0 && gr < NUM_GATE_REASONS) gate_counts[gr]++;
+                total_slow_cycles++;
+            }
+
             total_processed++;
             // update progress every 10K ticks (avoid atomic contention)
             if ((total_processed & 0x3FFF) == 0)
                 *progress_pct = (int)(100.0 * total_processed / total_ticks_all_files);
+        }
+
+        // per-file label computation: tick buffer is still loaded, use it directly
+        // load full next file as lookahead for complete forward visibility at file boundaries
+        if (run_cfg->collect_features && label_fn && file_sample_start < results->sample_count) {
+            int next_count = 0;
+            if (f + 1 < run_cfg->num_data_files)
+                BacktestData_Load(ticks + count, &next_count, max_ticks - count,
+                                  run_cfg->data_paths[f + 1]);
+            int label_total = count + next_count;
+
+            for (int s = file_sample_start; s < results->sample_count; s++) {
+                int local_idx = results->sample_tick_indices[s] - file_tick_offset;
+                int extra = (run_cfg->label_type == LABEL_REGIME)
+                    ? results->sample_regimes[s] : label_fwd;
+                results->labels[s] = label_fn(ticks, local_idx, label_total,
+                                               results->sample_prices[s],
+                                               label_tp, label_sl, extra);
+            }
+
+            if (next_count > 0)
+                fprintf(stderr, "[backtest] file %d/%d: %d labels, %d lookahead ticks from next file\n",
+                        f + 1, run_cfg->num_data_files,
+                        results->sample_count - file_sample_start, next_count);
         }
     }
 
@@ -479,6 +611,8 @@ done:
     double start_bal = FPN_ToDouble(cfg.starting_balance);
     BacktestStats_Compute(&results->stats, &ctrl, start_bal, elapsed);
     results->stats.ticks_processed = total_processed; // override: use actual file tick count
+    memcpy(results->stats.gate_counts, gate_counts, sizeof(gate_counts));
+    results->stats.total_slow_cycles = total_slow_cycles;
 
     // sharpe from equity curve, drawdown from controller (equity = balance + positions)
     if (results->equity_count > 1)
@@ -494,57 +628,36 @@ done:
         BacktestSnapshot_Copy<BACKTEST_FP>(out_snapshot, &ctrl, price_d_last, 0.0);
     }
 
-    // post-processing: compute labels (needs forward-looking tick data)
-    // reload last data file for label computation (labels look forward within this file)
-    if (run_cfg->collect_features && results->sample_count > 0 && run_cfg->num_data_files > 0) {
-        // reload the last file (or all files concatenated for multi-file)
-        int label_count = 0;
-        int label_max = (total_processed < 20000000) ? (int)total_processed + 1 : 20000000;
-        HistoricalTick *label_ticks = (HistoricalTick *)malloc((size_t)label_max * sizeof(HistoricalTick));
-        if (label_ticks) {
-            for (int f = 0; f < run_cfg->num_data_files; f++) {
-                if (label_count >= label_max) break;
-                int before = label_count;
-                BacktestData_Load(label_ticks + label_count, &label_count, label_max - label_count,
-                                  run_cfg->data_paths[f]);
-            }
-
-            // get label function from table
-            LabelFn label_fn = NULL;
-            for (int l = 0; l < LABEL_COUNT; l++) {
-                if (label_table[l].id == run_cfg->label_type) {
-                    label_fn = label_table[l].fn;
-                    break;
-                }
-            }
-            if (!label_fn) label_fn = Label_WinLoss; // fallback
-
-            double tp = run_cfg->label_tp_pct > 0 ? run_cfg->label_tp_pct : 1.5;
-            double sl = run_cfg->label_sl_pct > 0 ? run_cfg->label_sl_pct : 1.0;
-            int fwd = run_cfg->label_forward_ticks > 0 ? run_cfg->label_forward_ticks : 1000;
-
-            for (int s = 0; s < results->sample_count; s++) {
-                int tidx = results->sample_tick_indices[s];
-                if (tidx >= label_count) tidx = label_count - 1;
-                int extra = (run_cfg->label_type == LABEL_REGIME)
-                    ? results->sample_regimes[s] : fwd;
-                results->labels[s] = label_fn(label_ticks, tidx, label_count,
-                                               results->sample_prices[s], tp, sl, extra);
-            }
-            free(label_ticks);
-
-            fprintf(stderr, "[backtest] computed %d labels (type=%d, tp=%.1f%%, sl=%.1f%%)\n",
-                    results->sample_count, run_cfg->label_type, tp, sl);
-        }
-    }
+    // labels were computed per-file during replay (no post-pass reload needed)
+    if (run_cfg->collect_features && results->sample_count > 0)
+        fprintf(stderr, "[backtest] computed %d labels (type=%d, tp=%.1f%%, sl=%.1f%%)\n",
+                results->sample_count, run_cfg->label_type, label_tp, label_sl);
 
     // cleanup
     free(ticks);
+    free(file_tick_counts);
     free(ctrl.rolling_long);
 
     fprintf(stderr, "[backtest] completed: %lu ticks in %.1fms, %u trades, P&L $%.2f\n",
             results->stats.ticks_processed, elapsed,
             results->stats.total_trades, results->stats.total_pnl);
+
+    // gate reason breakdown — shows WHY the engine isn't trading
+    if (total_slow_cycles > 0) {
+        static const char *gr_names[] = {
+            "ok", "warmup", "no_signal", "no_trade", "book",
+            "danger", "kill", "recovery", "volatile", "cooldown",
+            "wind_down", "paused", "downtrend", "cost", "barrier"
+        };
+        fprintf(stderr, "[backtest] gate reason breakdown (%d slow-path cycles):\n", total_slow_cycles);
+        for (int g = 0; g < NUM_GATE_REASONS; g++) {
+            if (gate_counts[g] > 0) {
+                fprintf(stderr, "  %-12s %7d  (%5.1f%%)\n",
+                        gr_names[g], gate_counts[g],
+                        100.0 * gate_counts[g] / total_slow_cycles);
+            }
+        }
+    }
 }
 
 //======================================================================================================
@@ -637,41 +750,70 @@ static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
     if (min_train_samples < 50) min_train_samples = 50;
     wf->num_folds = n_splits;
 
-    int valid = ValidationSplit_Generate(wf->splits, data->sample_count,
-                                          n_splits, horizon_ticks,
-                                          buffer_ticks, min_train_samples);
+    // pre-compact: extract non-neutral samples into contiguous arrays
+    // barrier labels produce ~97% neutrals, so we must split over non-neutrals only
+    // otherwise later folds' test sets land in the all-neutral tail and get 0 samples
+    int nn_count = 0; // non-neutral count
+    for (int i = 0; i < data->sample_count; i++) {
+        if (data->labels[i] != 0.5f) nn_count++;
+    }
+
+    if (nn_count < 100) {
+        fprintf(stderr, "[walkforward] only %d non-neutral samples — need at least 100\n", nn_count);
+        *progress_pct = 100;
+        return;
+    }
+
+    // allocate compacted non-neutral data (features + labels + original indices for purge)
+    float *nn_features = (float *)malloc(nn_count * MODEL_NUM_FEATURES * sizeof(float));
+    float *nn_labels   = (float *)malloc(nn_count * sizeof(float));
+    int   *nn_indices  = (int *)malloc(nn_count * sizeof(int)); // original sample index
+    if (!nn_features || !nn_labels || !nn_indices) {
+        fprintf(stderr, "[walkforward] failed to allocate compaction buffers\n");
+        free(nn_features); free(nn_labels); free(nn_indices);
+        *progress_pct = 100;
+        return;
+    }
+
+    int j = 0;
+    for (int i = 0; i < data->sample_count; i++) {
+        if (data->labels[i] == 0.5f) continue;
+        memcpy(&nn_features[j * MODEL_NUM_FEATURES],
+               &data->feature_matrix[i * MODEL_NUM_FEATURES],
+               MODEL_NUM_FEATURES * sizeof(float));
+        nn_labels[j] = data->labels[i];
+        nn_indices[j] = i;
+        j++;
+    }
+
+    fprintf(stderr, "[walkforward] non-neutral samples: %d / %d total (%.1f%%)\n",
+            nn_count, data->sample_count, 100.0 * nn_count / data->sample_count);
+
+    // compute purge gap in non-neutral index space
+    // original purge_gap is in sample indices; scale by non-neutral density
+    int raw_purge = PurgeGap_Compute(horizon_ticks, buffer_ticks);
+    double nn_density = (double)nn_count / data->sample_count;
+    int nn_purge = (int)(raw_purge * nn_density + 0.5);
+    if (nn_purge < 1) nn_purge = 1;
+
+    fprintf(stderr, "[walkforward] purge gap: %d raw → %d in non-neutral space (density %.3f)\n",
+            raw_purge, nn_purge, nn_density);
+
+    // generate folds over non-neutral samples using explicit purge gap
+    // (ValidationSplit_Generate would apply FeatureLookback_Max in raw space, not non-neutral space)
+    int valid = ValidationSplit_GenerateExplicit(wf->splits, nn_count,
+                                                 n_splits, nn_purge,
+                                                 min_train_samples);
     wf->valid_folds = valid;
 
     if (valid == 0) {
         fprintf(stderr, "[walkforward] no valid folds — aborting\n");
+        free(nn_features); free(nn_labels); free(nn_indices);
         *progress_pct = 100;
         return;
     }
 
     ValidationSplit_Print(wf->splits, n_splits);
-
-    // allocate prediction buffer (reused per fold)
-    float *predictions = (float *)malloc(data->sample_count * sizeof(float));
-    if (!predictions) {
-        fprintf(stderr, "[walkforward] failed to allocate prediction buffer\n");
-        *progress_pct = 100;
-        return;
-    }
-
-    // allocate compaction buffers for neutral filtering (reused per fold)
-    // neutral labels (== 0.5f) are excluded — XGBoost binary needs 0 or 1 only
-    float *train_feat_buf = (float *)malloc(data->sample_count * MODEL_NUM_FEATURES * sizeof(float));
-    float *train_lbl_buf  = (float *)malloc(data->sample_count * sizeof(float));
-    float *test_feat_buf  = (float *)malloc(data->sample_count * MODEL_NUM_FEATURES * sizeof(float));
-    float *test_lbl_buf   = (float *)malloc(data->sample_count * sizeof(float));
-    if (!train_feat_buf || !train_lbl_buf || !test_feat_buf || !test_lbl_buf) {
-        fprintf(stderr, "[walkforward] failed to allocate compaction buffers\n");
-        free(predictions);
-        free(train_feat_buf); free(train_lbl_buf);
-        free(test_feat_buf);  free(test_lbl_buf);
-        *progress_pct = 100;
-        return;
-    }
 
     float sum_val = 0.0f, sum_val_sq = 0.0f, sum_train = 0.0f;
     int counted_folds = 0;
@@ -688,51 +830,29 @@ static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
             continue;
         }
 
-        fprintf(stderr, "[walkforward] fold %d/%d: training on %d samples, testing on %d...\n",
-                f + 1, n_splits, sp->train_count, sp->test_count);
+        int n_train = sp->train_count;
+        int n_test  = sp->test_count;
 
-        // compact train split — skip neutral labels (== 0.5f)
-        // XGBoost binary:logistic requires 0 or 1 only; 0.5 from Barrier labels must be excluded
-        int n_train = 0;
-        for (int i = 0; i < sp->train_count; i++) {
-            float lbl = data->labels[sp->train_start + i];
-            if (lbl == 0.5f) continue;
-            memcpy(&train_feat_buf[n_train * MODEL_NUM_FEATURES],
-                   &data->feature_matrix[(sp->train_start + i) * MODEL_NUM_FEATURES],
-                   MODEL_NUM_FEATURES * sizeof(float));
-            train_lbl_buf[n_train] = lbl;
-            n_train++;
-        }
-
-        // compact test split — skip neutral labels (== 0.5f)
-        int n_test = 0;
-        for (int i = 0; i < sp->test_count; i++) {
-            float lbl = data->labels[sp->test_start + i];
-            if (lbl == 0.5f) continue;
-            memcpy(&test_feat_buf[n_test * MODEL_NUM_FEATURES],
-                   &data->feature_matrix[(sp->test_start + i) * MODEL_NUM_FEATURES],
-                   MODEL_NUM_FEATURES * sizeof(float));
-            test_lbl_buf[n_test] = lbl;
-            n_test++;
-        }
-
-        fprintf(stderr, "[walkforward] fold %d/%d: after neutral filter — train %d→%d, test %d→%d\n",
-                f + 1, n_splits, sp->train_count, n_train, sp->test_count, n_test);
+        fprintf(stderr, "[walkforward] fold %d/%d: train=%d, test=%d (non-neutral)\n",
+                f + 1, n_splits, n_train, n_test);
 
         if (n_train < 10 || n_test < 5) {
-            fprintf(stderr, "[walkforward] fold %d: too few non-neutral samples — skipping\n", f + 1);
+            fprintf(stderr, "[walkforward] fold %d: too few samples — skipping\n", f + 1);
             fr->valid = 0;
             continue;
         }
 
-        const float *train_labels = train_lbl_buf;
-        const float *test_labels  = test_lbl_buf;
+        // pointers directly into the pre-compacted non-neutral arrays
+        const float *train_features = &nn_features[sp->train_start * MODEL_NUM_FEATURES];
+        const float *train_labels   = &nn_labels[sp->train_start];
+        const float *test_features  = &nn_features[sp->test_start * MODEL_NUM_FEATURES];
+        const float *test_labels    = &nn_labels[sp->test_start];
 
         DMatrixHandle dtrain = NULL, dtest = NULL;
         BoosterHandle booster = NULL;
 
-        // create train DMatrix from compacted (neutral-free) data
-        int ret = XGDMatrixCreateFromMat(train_feat_buf, n_train,
+        // create train DMatrix from pre-compacted non-neutral data
+        int ret = XGDMatrixCreateFromMat(train_features, n_train,
                                           MODEL_NUM_FEATURES, -1.0f, &dtrain);
         if (ret != 0) {
             fprintf(stderr, "[walkforward] fold %d: failed to create train DMatrix: %s\n",
@@ -742,8 +862,8 @@ static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
         }
         XGDMatrixSetFloatInfo(dtrain, "label", train_labels, n_train);
 
-        // create test DMatrix from compacted (neutral-free) data
-        ret = XGDMatrixCreateFromMat(test_feat_buf, n_test,
+        // create test DMatrix from pre-compacted non-neutral data
+        ret = XGDMatrixCreateFromMat(test_features, n_test,
                                       MODEL_NUM_FEATURES, -1.0f, &dtest);
         if (ret != 0) {
             fprintf(stderr, "[walkforward] fold %d: failed to create test DMatrix: %s\n",
@@ -839,11 +959,9 @@ static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
                 fr->overfit.is_overfit ? " [OVERFIT]" : "");
     }
 
-    free(predictions);
-    free(train_feat_buf);
-    free(train_lbl_buf);
-    free(test_feat_buf);
-    free(test_lbl_buf);
+    free(nn_features);
+    free(nn_labels);
+    free(nn_indices);
 
     // compute aggregate stats
     if (counted_folds > 0) {
@@ -1008,11 +1126,13 @@ static inline void Backtest_RunSweep(OptimizerResults *opt,
             run.collect_features = 0;
 
             BacktestResults results;
+            BacktestResults_Init(&results);
             int dummy_progress = 0;
             Backtest_Run(&results, &run, &dummy_progress, cancel_flag, NULL);
 
             opt->stats[idx] = results.stats;
             opt->metric[idx] = OptimizerMetric(&results.stats, metric_idx);
+            BacktestResults_Free(&results);
 
             if (opt->metric[idx] > best_metric) {
                 best_metric = opt->metric[idx];
