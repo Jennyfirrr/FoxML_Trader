@@ -56,13 +56,10 @@
 
 #define STRATEGY_MEAN_REVERSION 0
 #define STRATEGY_MOMENTUM      1
-#define STRATEGY_SIMPLE_DIP    2
-#define STRATEGY_ML            3
-#define STRATEGY_EMA_CROSS     4
-#define NUM_STRATEGIES         5
+#define NUM_STRATEGIES         2
 
 // strategy short names for display (indexed by strategy ID)
-static const char *STRATEGY_SHORT_NAMES[] = {"MR", "MOM", "DIP", "ML", "EMA"};
+static const char *STRATEGY_SHORT_NAMES[] = {"MR", "MOM"};
 
 //======================================================================================================
 // [REGIME CONSTANTS]
@@ -71,7 +68,7 @@ static const char *STRATEGY_SHORT_NAMES[] = {"MR", "MOM", "DIP", "ML", "EMA"};
 #define REGIME_TRENDING      1  // uptrend — momentum (buy breakouts above)
 #define REGIME_VOLATILE      2
 #define REGIME_TRENDING_DOWN 3  // downtrend — pause buying (future: short strategy)
-#define REGIME_MILD_TREND    4  // mild uptrend — EMA Cross (buy dips in uptrend)
+#define REGIME_MILD_TREND    4  // mild uptrend — mean reversion (buy dips in uptrend)
 #define NUM_REGIMES          5
 
 // regime info lookup table — single source of truth for display
@@ -82,16 +79,16 @@ static const RegimeInfo REGIME_INFO[] = {
     {"TREND", "TRENDING"},       // 1
     {"VOLAT", "VOLATILE"},       // 2
     {"TR_DN", "TRENDING_DOWN"},  // 3
-    {"EMACR", "MILD_TREND"},     // 4
+    {"MILD",  "MILD_TREND"},     // 4
 };
 
 // regime-to-strategy mapping table — branchless lookup
 static const int REGIME_STRATEGY_TABLE[] = {
     STRATEGY_MEAN_REVERSION,  // RANGING (0)
     STRATEGY_MOMENTUM,        // TRENDING (1)
-    STRATEGY_SIMPLE_DIP,      // VOLATILE (2)
+    STRATEGY_MEAN_REVERSION,  // VOLATILE (2)
     STRATEGY_MEAN_REVERSION,  // TRENDING_DOWN (3)
-    STRATEGY_EMA_CROSS,       // MILD_TREND (4)
+    STRATEGY_MEAN_REVERSION,  // MILD_TREND (4)
 };
 
 #endif // STRATEGY_INTERFACE_HPP

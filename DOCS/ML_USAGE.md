@@ -10,7 +10,7 @@ Phase 6-7 added ML infrastructure ported from FoxML. All features default OFF â€
 | Vol Scaling | `foxml_vol_scaling_enabled=1` | No | Scales position size inversely with volatility |
 | Bandit | `bandit_enabled=1` | No | Learns which strategies profit over time (Exp3-IX) |
 | Confidence | `confidence_enabled=1` | No | Dynamic ML threshold from prediction quality |
-| ML Strategy | `ml_backend=1` + model path | Yes | XGBoost/LightGBM buy signal model |
+| ML Buy Signal | `ml_backend=1` + model path | Yes | XGBoost/LightGBM buy signal model |
 | Barrier Gate | `barrier_gate_enabled=1` + models | Yes | Blocks entries before predicted price peaks |
 | Prediction Normalize | `prediction_normalize=1` | Yes | Z-score normalize model predictions |
 

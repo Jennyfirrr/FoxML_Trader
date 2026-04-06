@@ -9,7 +9,7 @@
 // Exp3-IX multi-armed bandit for online strategy/model selection with
 // importance-weighted updates and adaptive learning rate.
 //
-// arms are generic: strategies now (SimpleDip, MR, Momentum, EMACross, ML),
+// arms are generic: strategies now (MR, Momentum),
 // config variants later. string-named for display, int-indexed for speed.
 //
 // algorithm (from FoxML bandit.py):

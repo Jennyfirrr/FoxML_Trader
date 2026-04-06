@@ -18,9 +18,6 @@
 static inline const char *_strategy_str(int sid) {
     switch (sid) {
         case STRATEGY_MOMENTUM:   return "MOMENTUM";
-        case STRATEGY_SIMPLE_DIP: return "SIMPLE_DIP";
-        case STRATEGY_EMA_CROSS:  return "EMA_CROSS";
-        case STRATEGY_ML:         return "ML";
         default:                  return "MEAN_REVERSION";
     }
 }

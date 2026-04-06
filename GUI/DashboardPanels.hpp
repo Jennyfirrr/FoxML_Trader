@@ -189,9 +189,7 @@ static inline void GUI_Panel_Market(const TUISnapshot *s) {
     ImVec4 regime_color = (rj == REGIME_TRENDING) ? FoxmlColors::green :
                           (rj == REGIME_MILD_TREND) ? FoxmlColors::sand :
                           (rj == REGIME_VOLATILE || rj == REGIME_TRENDING_DOWN) ? FoxmlColors::red : FoxmlColors::comment;
-    const char *strat_name = (s->strategy_id == 4) ? "EMA CROSS" :
-                              (s->strategy_id == 2) ? "SIMPLE DIP" :
-                              (s->strategy_id == 1) ? "MOMENTUM" : "MEAN REVERSION";
+    const char *strat_name = (s->strategy_id == 1) ? "MOMENTUM" : "MEAN REVERSION";
     ImGui::TextColored(FoxmlColors::sand, "regime:");
     ImGui::SameLine();
     ImGui::TextColored(regime_color, "%s", REGIME_INFO[rj].full_name);

@@ -534,10 +534,59 @@ static inline void GUI_Panel_Comparison(ComparisonState *state, const BacktestRe
 }
 
 //======================================================================================================
+// [OPTIMIZER PARAM REGISTRY]
+//======================================================================================================
+// curated list of config fields worth sweeping — not all 80+ fields, just the ones
+// that meaningfully affect P&L. grouped by category for the dropdown.
+struct OptParamDef {
+    const char *key;        // exact config field name
+    const char *label;      // display name in dropdown
+    double default_lo, default_hi, default_step;
+};
+
+static const OptParamDef OPT_PARAM_DEFS[] = {
+    // exits
+    {"take_profit_pct",       "TP %",                 0.5,  4.0,  0.5},
+    {"stop_loss_pct",         "SL %",                 0.3,  2.0,  0.3},
+    {"min_sl_tp_ratio",       "Min SL/TP ratio",      0.3,  0.7,  0.1},
+    // entry
+    {"entry_offset_pct",      "Entry offset %",       0.5,  3.0,  0.5},
+    {"offset_stddev_mult",    "Offset stddev mult",   1.0,  5.0,  0.5},
+    {"volume_multiplier",     "Volume multiplier",    0.5,  3.0,  0.5},
+    {"spacing_multiplier",    "Spacing multiplier",   0.5,  3.0,  0.5},
+    // trailing
+    {"tp_hold_score",         "TP hold score",        0.2,  1.0,  0.2},
+    {"tp_trail_mult",         "TP trail mult",        0.5,  2.0,  0.25},
+    {"sl_trail_mult",         "SL trail mult",        0.3,  1.5,  0.25},
+    // momentum
+    {"momentum_breakout_mult","Momentum breakout",    0.5,  3.0,  0.5},
+    {"momentum_tp_mult",      "Momentum TP mult",     1.0,  5.0,  0.5},
+    {"momentum_sl_mult",      "Momentum SL mult",     0.5,  3.0,  0.5},
+    // risk
+    {"risk_pct",              "Risk %",               0.5,  3.0,  0.5},
+    {"max_exposure_pct",      "Max exposure %",       10.0, 50.0, 10.0},
+    {"slippage_pct",          "Slippage %",           0.01, 0.1,  0.01},
+    // regime
+    {"regime_hysteresis",     "Regime hysteresis",    2.0,  10.0, 2.0},
+    {"regime_crossover_threshold", "Crossover thresh",0.0001, 0.001, 0.0001},
+    // timing
+    {"warmup_ticks",          "Warmup ticks",         500,  5000, 500},
+    {"poll_interval",         "Poll interval",        50,   500,  50},
+    // danger
+    {"danger_warn_stddevs",   "Danger warn σ",        1.0,  4.0,  0.5},
+    {"danger_crash_stddevs",  "Danger crash σ",       2.0,  6.0,  0.5},
+    // cooldown
+    {"sl_cooldown_base",      "SL cooldown base",     1.0,  10.0, 1.0},
+    {"sl_cooldown_extra",     "SL cooldown extra",    0.0,  10.0, 2.0},
+};
+static const int OPT_PARAM_COUNT = sizeof(OPT_PARAM_DEFS) / sizeof(OPT_PARAM_DEFS[0]);
+
+//======================================================================================================
 // [OPTIMIZER PANEL STATE]
 //======================================================================================================
 struct OptimizerPanelState {
     OptimizerRange ranges[OPT_MAX_PARAMS];
+    int param_idx[OPT_MAX_PARAMS]; // index into OPT_PARAM_DEFS
     int num_params;
     int metric_idx;
     OptimizerResults results;
@@ -556,11 +605,17 @@ static inline void OptimizerPanel_Init(OptimizerPanelState *state) {
     memset(state, 0, sizeof(*state));
     state->num_params = 1;
     state->metric_idx = OPT_METRIC_PNL;
-    strncpy(state->ranges[0].key, "take_profit_pct", 31);
-    state->ranges[0].lo = 1.0; state->ranges[0].hi = 5.0; state->ranges[0].step = 0.5;
-    strncpy(state->ranges[1].key, "stop_loss_pct", 31);
-    state->ranges[1].lo = 0.5; state->ranges[1].hi = 3.0; state->ranges[1].step = 0.5;
-    strncpy(state->config_path, "engine.cfg", sizeof(state->config_path) - 1);
+    // default: sweep TP% and SL%
+    state->param_idx[0] = 0; // take_profit_pct
+    state->param_idx[1] = 1; // stop_loss_pct
+    for (int p = 0; p < OPT_MAX_PARAMS; p++) {
+        const OptParamDef *def = &OPT_PARAM_DEFS[state->param_idx[p]];
+        strncpy(state->ranges[p].key, def->key, 31);
+        state->ranges[p].lo = def->default_lo;
+        state->ranges[p].hi = def->default_hi;
+        state->ranges[p].step = def->default_step;
+    }
+    strncpy(state->config_path, "backtest.cfg", sizeof(state->config_path) - 1);
 }
 
 struct OptWorkerArgs {
@@ -591,16 +646,40 @@ static inline void GUI_Panel_Optimizer(OptimizerPanelState *state, DataPanelStat
     static const char *metric_names[] = {"Sharpe", "Profit Factor", "Expectancy", "Return %", "P&L $"};
     ImGui::Combo("Metric", &state->metric_idx, metric_names, 5);
 
-    ImGui::SliderInt("Parameters", &state->num_params, 1, 2);
+    ImGui::InputInt("Parameters", &state->num_params, 1, 1);
+    if (state->num_params < 1) state->num_params = 1;
+    if (state->num_params > 2) state->num_params = 2;
+
+    // build label list for dropdown (once, static)
+    static char combo_labels[512];
+    static bool combo_built = false;
+    if (!combo_built) {
+        char *p = combo_labels;
+        for (int i = 0; i < OPT_PARAM_COUNT; i++) {
+            int len = snprintf(p, sizeof(combo_labels) - (p - combo_labels),
+                               "%s", OPT_PARAM_DEFS[i].label);
+            p += len + 1; // null-separated for ImGui::Combo
+        }
+        *p = '\0'; // double-null terminator
+        combo_built = true;
+    }
 
     for (int p = 0; p < state->num_params; p++) {
         ImGui::PushID(p);
         char hdr[32]; snprintf(hdr, sizeof(hdr), "Param %d", p + 1);
         if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::InputText("Key", state->ranges[p].key, 32);
-            ImGui::InputDouble("Min", &state->ranges[p].lo, 0.1, 1.0, "%.2f");
-            ImGui::InputDouble("Max", &state->ranges[p].hi, 0.1, 1.0, "%.2f");
-            ImGui::InputDouble("Step", &state->ranges[p].step, 0.1, 0.5, "%.2f");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("Field", &state->param_idx[p], combo_labels, OPT_PARAM_COUNT)) {
+                // user picked a new param — load its defaults
+                const OptParamDef *def = &OPT_PARAM_DEFS[state->param_idx[p]];
+                strncpy(state->ranges[p].key, def->key, 31);
+                state->ranges[p].lo = def->default_lo;
+                state->ranges[p].hi = def->default_hi;
+                state->ranges[p].step = def->default_step;
+            }
+            ImGui::InputDouble("Min", &state->ranges[p].lo, 0.1, 1.0, "%.4f");
+            ImGui::InputDouble("Max", &state->ranges[p].hi, 0.1, 1.0, "%.4f");
+            ImGui::InputDouble("Step", &state->ranges[p].step, 0.1, 0.5, "%.4f");
             int steps = state->ranges[p].steps();
             ImGui::Text("%d steps", steps);
         }
@@ -752,6 +831,10 @@ struct TrainingPanelState {
     int max_depth;
     float learning_rate;
     int n_estimators;
+    float subsample;          // row subsampling per tree [0.5-1.0]
+    float colsample_bytree;   // feature subsampling per tree [0.5-1.0]
+    int min_child_weight;     // min samples per leaf (regularization)
+    float gamma;              // min loss reduction for split (regularization)
     int label_type;
     float label_tp_pct;
     float label_sl_pct;
@@ -786,6 +869,10 @@ static inline void TrainingPanel_Init(TrainingPanelState *state) {
     state->max_depth = 4;
     state->learning_rate = 0.1f;
     state->n_estimators = 100;
+    state->subsample = 0.8f;
+    state->colsample_bytree = 0.8f;
+    state->min_child_weight = 5;
+    state->gamma = 0.0f;
     state->label_type = LABEL_WIN_LOSS;
     state->label_tp_pct = 1.5f;
     state->label_sl_pct = 1.0f;
@@ -834,10 +921,18 @@ static inline void *walkforward_worker_fn(void *arg) {
     const BacktestResults *data = args->data;
     free(args);
 
+    XGBHyperparams hp;
+    hp.max_depth = state->max_depth;
+    hp.learning_rate = state->learning_rate;
+    hp.n_estimators = state->n_estimators;
+    hp.subsample = state->subsample;
+    hp.colsample_bytree = state->colsample_bytree;
+    hp.min_child_weight = state->min_child_weight;
+    hp.gamma = state->gamma;
     Backtest_RunWalkForward(&state->wf_results, data,
                              state->wf_n_splits, state->wf_horizon_ticks,
                              state->wf_buffer_ticks, state->wf_min_train,
-                             &state->wf_progress, &state->wf_cancel);
+                             &hp, &state->wf_progress, &state->wf_cancel);
 
     state->wf_has_results = true;
     state->wf_complete = 1;
@@ -926,8 +1021,9 @@ static inline void GUI_Panel_Training(TrainingPanelState *state,
     }
 
     // show feature collection status
+    // guard: don't read results while worker is running (realloc race — ASAN caught UAF here)
     BacktestResults *results = &run_control->results;
-    if (results->sample_count > 0) {
+    if (results->sample_count > 0 && !run_control->running) {
         // count label distribution
         state->positive_count = 0;
         state->negative_count = 0;
@@ -969,6 +1065,22 @@ static inline void GUI_Panel_Training(TrainingPanelState *state,
     ImGui::SetItemTooltip("Number of boosting rounds (trees)\n"
                           "more trees + low learning rate = better but slower\n"
                           "too many = overfitting (check walk-forward gap)");
+    ImGui::InputFloat("Subsample", &state->subsample, 0.05f, 0.1f, "%.2f");
+    ImGui::SetItemTooltip("Row subsampling per tree — random fraction of training data\n"
+                          "lower = more regularization, reduces overfitting\n"
+                          "0.5-0.7: aggressive, 0.8: moderate, 1.0: no subsampling");
+    ImGui::InputFloat("Col Sample", &state->colsample_bytree, 0.05f, 0.1f, "%.2f");
+    ImGui::SetItemTooltip("Feature subsampling per tree — random fraction of features\n"
+                          "lower = more regularization, forces diverse trees\n"
+                          "0.5-0.7: aggressive, 0.8: moderate, 1.0: use all features");
+    ImGui::InputInt("Min Child Wt", &state->min_child_weight, 1, 5);
+    ImGui::SetItemTooltip("Minimum sum of instance weight in a leaf node\n"
+                          "higher = more conservative splits, less overfitting\n"
+                          "1: default, 5-10: conservative, 20+: very conservative");
+    ImGui::InputFloat("Gamma", &state->gamma, 0.1f, 1.0f, "%.1f");
+    ImGui::SetItemTooltip("Minimum loss reduction required to make a split\n"
+                          "higher = fewer splits, simpler trees\n"
+                          "0: no penalty, 0.1-1.0: moderate, 5+: very conservative");
     ImGui::InputText("Model Path", state->model_path, sizeof(state->model_path));
     ImGui::SetItemTooltip("Where to save the trained model\n"
                           "used by the engine at runtime for ML buy signals");
@@ -1017,8 +1129,16 @@ static inline void GUI_Panel_Training(TrainingPanelState *state,
 
         char depth_s[8]; snprintf(depth_s, 8, "%d", state->max_depth);
         char lr_s[16]; snprintf(lr_s, 16, "%f", state->learning_rate);
+        char ss_s[16]; snprintf(ss_s, 16, "%f", state->subsample);
+        char cs_s[16]; snprintf(cs_s, 16, "%f", state->colsample_bytree);
+        char mcw_s[8]; snprintf(mcw_s, 8, "%d", state->min_child_weight);
+        char gm_s[16]; snprintf(gm_s, 16, "%f", state->gamma);
         XGBoosterSetParam(booster, "max_depth", depth_s);
         XGBoosterSetParam(booster, "eta", lr_s);
+        XGBoosterSetParam(booster, "subsample", ss_s);
+        XGBoosterSetParam(booster, "colsample_bytree", cs_s);
+        XGBoosterSetParam(booster, "min_child_weight", mcw_s);
+        XGBoosterSetParam(booster, "gamma", gm_s);
         XGBoosterSetParam(booster, "objective", "binary:logistic");
         XGBoosterSetParam(booster, "nthread", "4");
         XGBoosterSetParam(booster, "verbosity", "0");
@@ -1061,11 +1181,8 @@ static inline void GUI_Panel_Training(TrainingPanelState *state,
         state->train_accuracy = (n_valid > 0) ? (float)correct / n_valid * 100.0f : 0.0f;
         XGDMatrixFree(dpred);
 
-        // feature importance (gain-based)
-        memset(state->feature_importance, 0, sizeof(state->feature_importance));
-        // XGBoost doesn't have a simple GetScore in C API for all features
-        // use prediction contribution as a proxy: not available in all versions
-        // for now, zero-importance displayed (Phase 6: implement via dump/parse)
+        // feature importance (gain-based) via model dump parsing
+        XGB_ExtractImportance(booster, state->feature_importance);
 
         XGDMatrixFree(dtrain);
         XGBoosterFree(booster);
@@ -1096,6 +1213,29 @@ static inline void GUI_Panel_Training(TrainingPanelState *state,
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.55f, 0.76f, 0.51f, 1.0f), "%s", state->status_msg);
         ImGui::Text("Train Accuracy: %.1f%% (in-sample)", state->train_accuracy);
+
+        // feature importance (gain-based, sorted descending)
+        if (ImGui::TreeNode("Feature Importance")) {
+            // build sorted index
+            int order[MODEL_NUM_FEATURES];
+            for (int i = 0; i < MODEL_NUM_FEATURES; i++) order[i] = i;
+            for (int i = 0; i < MODEL_NUM_FEATURES - 1; i++)
+                for (int j = i + 1; j < MODEL_NUM_FEATURES; j++)
+                    if (state->feature_importance[order[j]] > state->feature_importance[order[i]]) {
+                        int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+                    }
+            float max_imp = state->feature_importance[order[0]];
+            for (int i = 0; i < MODEL_NUM_FEATURES; i++) {
+                int idx = order[i];
+                float imp = state->feature_importance[idx];
+                if (imp < 0.001f) continue; // skip near-zero
+                float frac = (max_imp > 0) ? imp / max_imp : 0;
+                char label[48];
+                snprintf(label, sizeof(label), "%s  %.1f%%", state->feature_names[idx], imp * 100.0f);
+                ImGui::ProgressBar(frac, ImVec2(-1, 0), label);
+            }
+            ImGui::TreePop();
+        }
 
         // save run: bundle config + model into models/{run_name}/
         ImGui::Separator();
@@ -1143,6 +1283,10 @@ static inline void GUI_Panel_Training(TrainingPanelState *state,
                 fprintf(sf, "max_depth: %d\n", state->max_depth);
                 fprintf(sf, "learning_rate: %.3f\n", state->learning_rate);
                 fprintf(sf, "n_estimators: %d\n", state->n_estimators);
+                fprintf(sf, "subsample: %.2f\n", state->subsample);
+                fprintf(sf, "colsample_bytree: %.2f\n", state->colsample_bytree);
+                fprintf(sf, "min_child_weight: %d\n", state->min_child_weight);
+                fprintf(sf, "gamma: %.1f\n", state->gamma);
                 fclose(sf);
             }
 
@@ -1315,6 +1459,34 @@ static inline void GUI_Panel_Training(TrainingPanelState *state,
                 }
             }
             ImGui::EndTable();
+            ImGui::TreePop();
+        }
+
+        // feature importance (averaged across folds)
+        if (ImGui::TreeNode("Feature Importance (avg across folds)")) {
+            int order[MODEL_NUM_FEATURES];
+            for (int i = 0; i < MODEL_NUM_FEATURES; i++) order[i] = i;
+            for (int i = 0; i < MODEL_NUM_FEATURES - 1; i++)
+                for (int j = i + 1; j < MODEL_NUM_FEATURES; j++)
+                    if (wf->avg_importance[order[j]] > wf->avg_importance[order[i]]) {
+                        int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+                    }
+            float max_imp = wf->avg_importance[order[0]];
+            for (int i = 0; i < MODEL_NUM_FEATURES; i++) {
+                int idx = order[i];
+                float imp = wf->avg_importance[idx];
+                if (imp < 0.001f) continue;
+                float frac = (max_imp > 0) ? imp / max_imp : 0;
+                char label[48];
+                snprintf(label, sizeof(label), "%s  %.1f%%",
+                         state->feature_names[idx], imp * 100.0f);
+                ImGui::ProgressBar(frac, ImVec2(-1, 0), label);
+            }
+            ImGui::SetItemTooltip("Gain-based importance averaged across walk-forward folds\n"
+                                  "shows which features the model relies on most\n\n"
+                                  "if top features are noisy (vol_delta, ror_slope) the model\n"
+                                  "may be fitting noise — stable features (price_avg, stddev)\n"
+                                  "suggest more robust predictions");
             ImGui::TreePop();
         }
     }

@@ -281,7 +281,7 @@ inline int Regime_Classify(RegimeState<F> *state,
     // trending needs at least 2 signals AND at least one crossover signal
     // volatile needs at least 2 signals (spike + no direction)
     // direction: more down signals = TRENDING_DOWN, otherwise TRENDING (up)
-    // uptrend split: strong crossover = TRENDING (momentum), mild = MILD_TREND (EMA Cross)
+    // uptrend split: strong crossover = TRENDING (momentum), mild = MILD_TREND (MR)
     int has_crossover = crossover_strong | long_crossover_strong;
     int detected;
     if (trending_score >= 2 && has_crossover && consistent && trending_score > volatile_score) {

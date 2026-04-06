@@ -23,10 +23,9 @@
 #include "../DataStream/TradeLog.hpp"
 #include "../ML_Headers/RollingStats.hpp"
 #include "../ML_Headers/WelfordStats.hpp"
+#include "../ML_Headers/ModelInference.hpp"
 #include "../Strategies/MeanReversion.hpp"
 #include "../Strategies/Momentum.hpp"
-#include "../Strategies/SimpleDip.hpp"
-#include "../Strategies/MLStrategy.hpp"
 #include "../Strategies/RegimeDetector.hpp"
 #include "../ML_Headers/CostModel.hpp"
 #include "../ML_Headers/BarrierGate.hpp"
@@ -34,9 +33,6 @@
 #include "../ML_Headers/VolScaler.hpp"
 #include "../ML_Headers/ConfidenceScore.hpp"
 #include "../ML_Headers/BanditLearning.hpp"
-#if __has_include("../Strategies/private/EmaCross.hpp")
-#include "../Strategies/private/EmaCross.hpp"
-#endif
 #include <stdio.h>
 #include <time.h>
 
@@ -166,7 +162,7 @@ template <unsigned F> struct PortfolioController {
     uint32_t losses;
     uint32_t total_trades;
   };
-  StrategyStats strategy_stats[5]; // 0=MR, 1=Momentum, 2=SimpleDip, 3=ML, 4=EmaCross
+  StrategyStats strategy_stats[5]; // 0=MR, 1=Momentum
 
   int state;
   FPN<F> price_sum;
@@ -176,11 +172,6 @@ template <unsigned F> struct PortfolioController {
   int strategy_id;
   MeanReversionState<F> mean_rev;
   MomentumState<F> momentum;
-  SimpleDipState<F> simple_dip;
-  MLStrategyState<F> ml_strategy;
-#ifdef STRATEGY_EMA_CROSS
-  EmaCrossState<F> ema_cross;
-#endif
   RegimeState<F> regime;
   ModelHandle<F> regime_model;       // Mode A: regime signal enrichment model
   ModelHandle<F> peak_model;         // barrier gate: P(will_peak) model
@@ -190,7 +181,7 @@ template <unsigned F> struct PortfolioController {
   uint64_t pred_norm_count;
   double pred_norm_mean;
   double pred_norm_m2;               // Welford M2 for variance
-  RegimeSignals<F> last_signals;     // cached for ML strategy BuySignal access
+  RegimeSignals<F> last_signals;     // cached regime signals for strategy access
 
   RORRegressor<F> regime_ror;  // slope-of-slopes for trend acceleration detection
   FPN<F> volume_spike_ratio;   // current_volume / rolling.volume_max (spike detection)
@@ -253,6 +244,17 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
   ctrl->buy_conds.volume = FPN_Zero<F>();
   ctrl->buy_conds.gate_direction = 0;  // default: buy below (mean reversion)
 
+  // hot-path fields — must be explicitly zeroed (not guaranteed by caller)
+  // without this, re-init on a non-zeroed struct (backtest day boundary, future
+  // persistent connections) leaves stale values that defeat cross-day isolation
+  ctrl->ema_price = FPN_Zero<F>();
+  ctrl->ema_initialized = 0;
+  ctrl->gate_offset = FPN_Zero<F>();
+  ctrl->danger_warn = FPN_Zero<F>();
+  ctrl->danger_crash = FPN_Zero<F>();
+  ctrl->danger_range_inv = FPN_Zero<F>();
+  ctrl->danger_score = FPN_Zero<F>();
+
   // init strategy states — both ready at startup so regime switch is instant
   ctrl->strategy_id = STRATEGY_MEAN_REVERSION;
   // mean reversion
@@ -272,14 +274,6 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
   ctrl->momentum.live_vol_mult = config.volume_multiplier;
   ctrl->momentum.buy_conds_initial = ctrl->buy_conds;
   ctrl->momentum.has_regression = 0;
-  // ML strategy
-  Model_Init(&ctrl->ml_strategy.buy_model);
-  ctrl->ml_strategy.model_ready = 0;
-  ctrl->ml_strategy.last_prediction = FPN_Zero<F>();
-  memset(ctrl->ml_strategy.feature_buf, 0, sizeof(ctrl->ml_strategy.feature_buf));
-  // load ML models if configured
-  if (config.ml_backend != 0)
-    Model_Load(&ctrl->ml_strategy.buy_model, config.ml_model_path, config.ml_backend);
   Model_Init(&ctrl->regime_model);
   if (config.regime_model_backend != 0)
     Model_Load(&ctrl->regime_model, config.regime_model_path, config.regime_model_backend);
@@ -333,11 +327,6 @@ inline void PortfolioController_Init(PortfolioController<F> *ctrl,
               FPN_ToDouble(config.bandit_blend_ratio), BANDIT_MIN_SAMPLES_DEFAULT, BANDIT_RAMP_UP_DEFAULT);
   Bandit_SetArmName(&ctrl->bandit, STRATEGY_MEAN_REVERSION, "MR");
   Bandit_SetArmName(&ctrl->bandit, STRATEGY_MOMENTUM, "Momentum");
-  Bandit_SetArmName(&ctrl->bandit, STRATEGY_SIMPLE_DIP, "SimpleDip");
-  Bandit_SetArmName(&ctrl->bandit, STRATEGY_ML, "ML");
-#ifdef STRATEGY_EMA_CROSS
-  Bandit_SetArmName(&ctrl->bandit, STRATEGY_EMA_CROSS, "EmaCross");
-#endif
   for (int i = 0; i < 5; i++) {
     ctrl->strategy_stats[i].realized_pnl = FPN_Zero<F>();
     ctrl->strategy_stats[i].wins = 0;
@@ -470,14 +459,6 @@ inline void RecordExit(PortfolioController<F> *ctrl, ExitRecord<F> *rec) {
             ctrl->strategy_stats[strat].realized_pnl, pos_pnl);
     }
 
-    // feed confidence scorer: (entry_prediction, actual_outcome)
-    // actual = 1.0 if profitable, 0.0 if not (matches binary classification target)
-    if (ctrl->config.confidence_enabled && strat == STRATEGY_ML) {
-        double pred = ctrl->entry_prediction[slot];
-        double actual = (!pos_pnl.sign & !FPN_IsZero(pos_pnl)) ? 1.0 : 0.0;
-        ConfidenceScorer_Update(&ctrl->confidence, pred, actual);
-    }
-
     // feed bandit learner: update arm = entry strategy, reward = P&L in bps
     if (ctrl->config.bandit_enabled && strat >= 0 && strat < NUM_STRATEGIES) {
         double entry_d = FPN_ToDouble(rec->entry_price);
@@ -564,12 +545,12 @@ inline void RecordExit(PortfolioController<F> *ctrl, ExitRecord<F> *rec) {
     const char *reasons[] = {"TP", "SL", "TIME", "SESSION_CLOSE"};
     {
       double pnl_d = FPN_ToDouble(pos_pnl);
-      static const char *sn[] = {"MR", "MOM", "DIP", "ML", "EMA"};
+      static const char *sn[] = {"MR", "MOM"};
       char ts[16]; log_ts(ts, sizeof(ts));
       fprintf(stderr, "[%s] [TRADE] SELL $%.2f × %.6f %s %s$%.2f %s bal=$%.2f\n",
               ts, exit_d, qty_d, reasons[reason],
               pnl_d >= 0 ? "+" : "", pnl_d,
-              (strat >= 0 && strat < 5) ? sn[strat] : "?",
+              (strat >= 0 && strat < NUM_STRATEGIES) ? sn[strat] : "?",
               FPN_ToDouble(ctrl->balance));
     }
     TradeLogBuffer_PushSell(&ctrl->trade_buf, rec->tick, exit_d, qty_d, entry_d, delta_pct,
@@ -638,42 +619,6 @@ inline void PortfolioController_StrategyBuySignal(PortfolioController<F> *ctrl) 
                                           gate_avg);
     ctrl->buy_conds.gate_direction = 1;
     break;
-  case STRATEGY_SIMPLE_DIP:
-    ctrl->buy_conds = SimpleDip_BuySignal(&ctrl->simple_dip, &ctrl->rolling,
-                                           ctrl->rolling_long, &ctrl->config);
-    ctrl->buy_conds.gate_direction = 0;
-    break;
-#ifdef STRATEGY_EMA_CROSS
-  case STRATEGY_EMA_CROSS:
-    ctrl->buy_conds = EmaCross_BuySignal(&ctrl->ema_cross, &ctrl->rolling,
-                                          ctrl->rolling_long, &ctrl->config,
-                                          gate_avg);
-    ctrl->buy_conds.gate_direction = 0;
-    break;
-#endif
-  case STRATEGY_ML:
-    ctrl->buy_conds = MLStrategy_BuySignal(&ctrl->ml_strategy, &ctrl->rolling,
-                                            ctrl->rolling_long, (const void*)&ctrl->config,
-                                            &ctrl->last_signals);
-    ctrl->buy_conds.gate_direction = 0;
-    // prediction z-score normalization (Phase 7F)
-    if (ctrl->config.prediction_normalize && !FPN_IsZero(ctrl->ml_strategy.last_prediction)) {
-        double raw = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
-        ctrl->pred_norm_count++;
-        double delta = raw - ctrl->pred_norm_mean;
-        ctrl->pred_norm_mean += delta / (double)ctrl->pred_norm_count;
-        ctrl->pred_norm_m2 += delta * (raw - ctrl->pred_norm_mean);
-        // normalize after 100 predictions (enough for stable variance estimate)
-        if (ctrl->pred_norm_count >= 100) {
-            double variance = ctrl->pred_norm_m2 / (double)ctrl->pred_norm_count;
-            double stddev = (variance > 1e-15) ? sqrt(variance) : 1.0;
-            double z = (raw - ctrl->pred_norm_mean) / stddev;
-            // sigmoid transform: map z-score to [0, 1] for threshold comparison
-            double normalized = 1.0 / (1.0 + exp(-z));
-            ctrl->ml_strategy.last_prediction = FPN_FromDouble<F>(normalized);
-        }
-    }
-    break;
   }
 
   // gate reason: set based on whether strategy produced a valid price
@@ -737,26 +682,6 @@ inline void PortfolioController_StrategyDispatch(PortfolioController<F> *ctrl,
                     &ctrl->config);
     Momentum_ExitAdjust(&ctrl->portfolio, current_price, &ctrl->rolling,
                          &ctrl->momentum, &ctrl->config);
-    break;
-  case STRATEGY_SIMPLE_DIP:
-    SimpleDip_Adapt(&ctrl->simple_dip, current_price, ctrl->portfolio_delta,
-                     ctrl->portfolio.active_bitmap, &ctrl->buy_conds,
-                     &ctrl->config);
-    break;
-#ifdef STRATEGY_EMA_CROSS
-  case STRATEGY_EMA_CROSS:
-    EmaCross_Adapt(&ctrl->ema_cross, current_price, ctrl->portfolio_delta,
-                    ctrl->portfolio.active_bitmap, &ctrl->buy_conds, &ctrl->config);
-    EmaCross_ExitAdjust(&ctrl->portfolio, current_price, &ctrl->rolling,
-                         &ctrl->ema_cross, &ctrl->config);
-    break;
-#endif
-  case STRATEGY_ML:
-    MLStrategy_Adapt(&ctrl->ml_strategy, current_price, ctrl->portfolio_delta,
-                      ctrl->portfolio.active_bitmap, &ctrl->buy_conds,
-                      (const void*)&ctrl->config);
-    MLStrategy_ExitAdjust(&ctrl->portfolio, current_price, &ctrl->rolling,
-                           &ctrl->ml_strategy, &ctrl->config);
     break;
   }
   PortfolioController_StrategyBuySignal(ctrl);
@@ -926,21 +851,16 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
         && ctrl->rolling.count >= (int)ctrl->config.min_warmup_samples) {
       MeanReversion_Init(&ctrl->mean_rev, &ctrl->rolling, &ctrl->buy_conds);
       Momentum_Init(&ctrl->momentum, &ctrl->rolling, &ctrl->buy_conds);
-      SimpleDip_Init(&ctrl->simple_dip, &ctrl->rolling, &ctrl->buy_conds);
-      MLStrategy_Init(&ctrl->ml_strategy, &ctrl->rolling, &ctrl->buy_conds);
-#ifdef STRATEGY_EMA_CROSS
-      EmaCross_Init(&ctrl->ema_cross, &ctrl->rolling, &ctrl->buy_conds);
-#endif
-      // use configured default strategy (0=MR, 1=Momentum, 2=SimpleDip)
+      // use configured default strategy (0=MR, 1=Momentum)
       if (ctrl->config.default_strategy >= 0)
           ctrl->strategy_id = ctrl->config.default_strategy;
       PortfolioController_StrategyDispatch(ctrl, current_price);
       ctrl->state = CONTROLLER_ACTIVE;
-      static const char *strat_names[] = {"MR", "Momentum", "SimpleDip", "ML", "EmaCross"};
+      static const char *strat_names[] = {"MR", "Momentum"};
       int sid = ctrl->strategy_id;
       { char ts[16]; log_ts(ts, sizeof(ts));
       fprintf(stderr, "[%s] [SESSION] warmup complete — %d samples, strategy=%s, price=$%.2f\n",
-              ts, ctrl->rolling.count, (sid >= 0 && sid < 5) ? strat_names[sid] : "?",
+              ts, ctrl->rolling.count, (sid >= 0 && sid < NUM_STRATEGIES) ? strat_names[sid] : "?",
               FPN_ToDouble(current_price)); }
     }
 
@@ -1215,8 +1135,8 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
           ctrl->entry_time[slot_b] = ctrl->sim_time;
           ctrl->entry_strategy[slot_a] = (uint8_t)ctrl->strategy_id;
           ctrl->entry_strategy[slot_b] = (uint8_t)ctrl->strategy_id;
-          ctrl->entry_prediction[slot_a] = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
-          ctrl->entry_prediction[slot_b] = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
+          ctrl->entry_prediction[slot_a] = 0.0;
+          ctrl->entry_prediction[slot_b] = 0.0;
           ctrl->portfolio.positions[slot_a].original_tp = tp_price;
           ctrl->portfolio.positions[slot_a].original_sl = sl_price;
           ctrl->portfolio.positions[slot_b].original_tp = tp2_price;
@@ -1239,7 +1159,7 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
           ctrl->entry_ticks[slot] = ctrl->total_ticks;
           ctrl->entry_time[slot] = ctrl->sim_time;
           ctrl->entry_strategy[slot] = (uint8_t)ctrl->strategy_id;
-          ctrl->entry_prediction[slot] = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
+          ctrl->entry_prediction[slot] = 0.0;
           ctrl->portfolio.positions[slot].original_tp = tp_price;
           ctrl->portfolio.positions[slot].original_sl = sl_price;
           fill_ok = 1;
@@ -1251,12 +1171,12 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
         ctrl->total_buys++;
         ctrl->idle_cycles = 0;  // reset gate death spiral counter
         {
-          static const char *sn[] = {"MR", "MOM", "DIP", "ML", "EMA"};
+          static const char *sn[] = {"MR", "MOM"};
           int si = ctrl->strategy_id;
           char ts[16]; log_ts(ts, sizeof(ts));
           fprintf(stderr, "[%s] [TRADE] BUY $%.2f × %.6f ($%.2f) %s tp=$%.2f sl=$%.2f bal=$%.2f\n",
                   ts, FPN_ToDouble(fill_price), FPN_ToDouble(sized_qty), FPN_ToDouble(cost),
-                  (si >= 0 && si < 5) ? sn[si] : "?",
+                  (si >= 0 && si < NUM_STRATEGIES) ? sn[si] : "?",
                   FPN_ToDouble(tp_price), FPN_ToDouble(sl_price),
                   FPN_ToDouble(FPN_SubSat(ctrl->balance, total_cost)));
         }
@@ -1473,7 +1393,7 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
           (double)Model_Predict(&ctrl->regime_model, feat_buf, n));
     }
 
-    ctrl->last_signals = signals; // cache for MLStrategy_BuySignal
+    ctrl->last_signals = signals; // cached regime signals for strategy access
 
     int old_regime = ctrl->regime.current_regime;
     Regime_Classify(&ctrl->regime, &signals, &ctrl->config);
@@ -1505,7 +1425,7 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
           Regime_AdjustPositions(&ctrl->portfolio, &ctrl->rolling,
                                   old_regime, new_regime, ctrl->entry_strategy, &ctrl->config);
       } else if (ctrl->config.default_strategy <= -2) {
-        // full 4-strategy auto: MR + EMA Cross + Momentum + SimpleDip
+        // full auto: MR + Momentum
         int old_strategy = ctrl->strategy_id;
         int regime_pick = Regime_ToStrategy(new_regime);
 
@@ -1562,24 +1482,6 @@ inline void PortfolioController_Tick(PortfolioController<F> *ctrl,
   // wider mult = more volume required = fewer entries during low-liquidity sessions
   if (ctrl->config.session_filter_enabled) {
     ctrl->buy_conds.volume = FPN_Mul(ctrl->buy_conds.volume, ctrl->session_mult);
-  }
-
-  // CONFIDENCE GATE: raise ML threshold when prediction quality is low
-  // effective_threshold = base * (2 - confidence) — high confidence = same threshold,
-  // low confidence = up to 2x threshold (suppresses marginal signals)
-  if (ctrl->config.confidence_enabled && ctrl->strategy_id == STRATEGY_ML
-      && !FPN_IsZero(ctrl->buy_conds.price)) {
-    double conf = ConfidenceScorer_Compute(&ctrl->confidence, 0.0); // data_age=0 (live)
-    ctrl->last_confidence = conf;
-    double base_thr = FPN_ToDouble(ctrl->config.ml_buy_threshold);
-    double effective_thr = base_thr * (2.0 - conf);
-    if (effective_thr > 1.0) effective_thr = 1.0;
-    double pred = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
-    if (pred > 0.0 && pred < effective_thr) {
-      ctrl->buy_conds.price = FPN_Zero<F>();
-      ctrl->buy_conds.volume = FPN_Zero<F>();
-      ctrl->gate_reason = GATE_REASON_NO_SIGNAL;
-    }
   }
 
   // book imbalance gate: require bid excess before buying
@@ -1743,7 +1645,7 @@ inline void PortfolioController_HotReload(PortfolioController<F> *ctrl,
     ctrl->regime.hysteresis_threshold = new_cfg.regime_hysteresis;
 
     // live strategy switch
-    // default_strategy >= 0: explicit strategy selection (0=MR, 1=Momentum, 2=SimpleDip)
+    // default_strategy >= 0: explicit strategy selection (0=MR, 1=Momentum)
     // default_strategy == -1: regime auto mode (regime detector picks the strategy)
     if (new_cfg.default_strategy >= 0 && new_cfg.default_strategy != ctrl->strategy_id) {
         ctrl->strategy_id = new_cfg.default_strategy;

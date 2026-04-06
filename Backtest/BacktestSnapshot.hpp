@@ -25,6 +25,7 @@ static inline void BacktestSnapshot_Copy(TUISnapshot *snap,
 
     // backtest-specific overrides
     snap->live_trading = 0; // always paper in backtest
+    snap->is_backtest = 1;  // suppresses static gate line on chart
 }
 
 #endif // BACKTEST_SNAPSHOT_HPP

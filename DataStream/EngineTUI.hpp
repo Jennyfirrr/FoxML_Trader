@@ -724,10 +724,9 @@ static inline void MLSnapshot_Populate(MLSnapshot *snap, const PortfolioControll
     snap->cost_breakeven = CostModel_Breakeven(ctrl->last_cost_bps);
 
     // model info
-    snap->ml_model_loaded = Model_IsLoaded(&ctrl->ml_strategy.buy_model);
-    snap->ml_last_prediction = FPN_ToDouble(ctrl->ml_strategy.last_prediction);
-    strncpy(snap->ml_model_path, ctrl->ml_strategy.buy_model.model_path, 255);
-    snap->ml_model_path[255] = '\0';
+    snap->ml_model_loaded = 0;
+    snap->ml_last_prediction = 0.0;
+    snap->ml_model_path[0] = '\0';
     snap->regime_model_loaded = Model_IsLoaded(&ctrl->regime_model);
     strncpy(snap->regime_model_path, ctrl->regime_model.model_path, 255);
     snap->regime_model_path[255] = '\0';
@@ -748,6 +747,7 @@ struct TUISnapshot {
     // state
     int state_warmup; // 1 = warmup, 0 = active
     int is_paused;
+    int is_backtest;  // 1 = backtest mode (suppresses static gate line on chart)
     uint64_t start_time;
     // rolling stats
     double roll_price_avg, roll_stddev, roll_p_min, roll_p_max;
@@ -913,6 +913,7 @@ static inline void TUI_CopySnapshot(TUISnapshot *snap,
     snap->volume = volume_d;
     snap->state_warmup = (ctrl->state == CONTROLLER_WARMUP);
     snap->is_paused = FPN_IsZero(ctrl->buy_conds.price) && !snap->state_warmup;
+    snap->is_backtest = 0; // live engine — BacktestSnapshot_Copy overrides to 1
     snap->start_time = 0; // TUI thread computes uptime from its own start_time
 
     // rolling stats

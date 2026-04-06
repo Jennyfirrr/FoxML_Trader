@@ -1960,12 +1960,12 @@ int main() {
               Regime_ToStrategy(REGIME_RANGING) == STRATEGY_MEAN_REVERSION);
         check("ToStrategy: TRENDING -> MOMENTUM",
               Regime_ToStrategy(REGIME_TRENDING) == STRATEGY_MOMENTUM);
-        check("ToStrategy: VOLATILE -> SIMPLE_DIP",
-              Regime_ToStrategy(REGIME_VOLATILE) == STRATEGY_SIMPLE_DIP);
+        check("ToStrategy: VOLATILE -> MR",
+              Regime_ToStrategy(REGIME_VOLATILE) == STRATEGY_MEAN_REVERSION);
         check("ToStrategy: TRENDING_DOWN -> MR",
               Regime_ToStrategy(REGIME_TRENDING_DOWN) == STRATEGY_MEAN_REVERSION);
-        check("ToStrategy: MILD_TREND -> EMA_CROSS",
-              Regime_ToStrategy(REGIME_MILD_TREND) == STRATEGY_EMA_CROSS);
+        check("ToStrategy: MILD_TREND -> MR",
+              Regime_ToStrategy(REGIME_MILD_TREND) == STRATEGY_MEAN_REVERSION);
         check("ToStrategy: out-of-range -> MR",
               Regime_ToStrategy(99) == STRATEGY_MEAN_REVERSION);
 
@@ -1973,9 +1973,9 @@ int main() {
         check("RegimeInfo: RANGING short_name",
               strcmp(REGIME_INFO[REGIME_RANGING].short_name, "RANGE") == 0);
         check("RegimeInfo: MILD_TREND short_name",
-              strcmp(REGIME_INFO[REGIME_MILD_TREND].short_name, "EMACR") == 0);
+              strcmp(REGIME_INFO[REGIME_MILD_TREND].short_name, "MILD") == 0);
         check("RegimeInfo: NUM_REGIMES == 5", NUM_REGIMES == 5);
-        check("NUM_STRATEGIES == 5", NUM_STRATEGIES == 5);
+        check("NUM_STRATEGIES == 2", NUM_STRATEGIES == 2);
 
         // Regime_Classify integration is tested via the full controller path
         // (SL floor tests above exercise actual regime transitions)
@@ -2019,9 +2019,9 @@ int main() {
             "MILD_TREND->TRENDING_DOWN",
         };
         int strategies[] = {
-            STRATEGY_MEAN_REVERSION, STRATEGY_EMA_CROSS,
-            STRATEGY_MOMENTUM, STRATEGY_EMA_CROSS,
-            STRATEGY_EMA_CROSS,
+            STRATEGY_MEAN_REVERSION, STRATEGY_MEAN_REVERSION,
+            STRATEGY_MOMENTUM, STRATEGY_MEAN_REVERSION,
+            STRATEGY_MEAN_REVERSION,
         };
 
         for (int t = 0; t < 5; t++) {
@@ -2182,21 +2182,21 @@ int main() {
     {
         // -1 legacy: only MR and Momentum
         check("dispatch -1: RANGING → MR",
-              STRATEGY_MEAN_REVERSION == STRATEGY_MEAN_REVERSION); // trivial, for completeness
-        check("dispatch -1: TRENDING → MOMENTUM (not EMA Cross)",
-              STRATEGY_MOMENTUM != STRATEGY_EMA_CROSS);
+              Regime_ToStrategy(REGIME_RANGING) == STRATEGY_MEAN_REVERSION);
+        check("dispatch -1: TRENDING → MOMENTUM",
+              Regime_ToStrategy(REGIME_TRENDING) == STRATEGY_MOMENTUM);
 
-        // -2 full auto: verify all mappings produce distinct strategies
+        // -2 full auto: verify regime mappings
         int ranging_s   = Regime_ToStrategy(REGIME_RANGING);
         int trending_s  = Regime_ToStrategy(REGIME_TRENDING);
         int volatile_s  = Regime_ToStrategy(REGIME_VOLATILE);
         int mild_s      = Regime_ToStrategy(REGIME_MILD_TREND);
-        check("dispatch -2: 4 strategies used (MR, MOM, DIP, EMA)",
-              ranging_s != trending_s && trending_s != volatile_s && volatile_s != mild_s);
-        check("dispatch -2: VOLATILE uses SimpleDip (not MR)",
-              volatile_s == STRATEGY_SIMPLE_DIP);
-        check("dispatch -2: MILD_TREND uses EMA Cross (not Momentum)",
-              mild_s == STRATEGY_EMA_CROSS);
+        check("dispatch -2: RANGING uses MR",
+              ranging_s == STRATEGY_MEAN_REVERSION);
+        check("dispatch -2: VOLATILE uses MR",
+              volatile_s == STRATEGY_MEAN_REVERSION);
+        check("dispatch -2: MILD_TREND uses MR",
+              mild_s == STRATEGY_MEAN_REVERSION);
     }
 
     //======================================================================================================

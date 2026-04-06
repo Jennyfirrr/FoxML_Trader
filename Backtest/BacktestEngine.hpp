@@ -401,6 +401,7 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
 
     double price_d_last = 0.0; // track last price for snapshot
     int64_t last_day_ms = 0;  // day boundary detection (ms timestamp of last midnight)
+    FPN<BACKTEST_FP> overall_max_drawdown = FPN_Zero<BACKTEST_FP>(); // tracks max across day resets
 
     // resolve label function + params before file loop (used per-file after replay)
     LabelFn label_fn = NULL;
@@ -473,23 +474,83 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
                     ExitBuffer_Clear(&ctrl.exit_buf);
                 }
 
-                // reset session state
-                FPN<BACKTEST_FP> equity = ctrl.balance; // no positions after force-close
-                ctrl.session_start_equity = equity;
-                ctrl.peak_equity = equity;
-                ctrl.daily_realized_pnl = FPN_Zero<BACKTEST_FP>();
-                ctrl.sl_cooldown_counter = 0;
-                ctrl.idle_cycles = 0;
+                // --- save cumulative stats that must survive day boundaries ---
+                FPN<BACKTEST_FP> save_balance = ctrl.balance;
+                FPN<BACKTEST_FP> save_rpnl = ctrl.realized_pnl;
+                FPN<BACKTEST_FP> save_fees = ctrl.total_fees;
+                uint32_t save_wins = ctrl.wins, save_losses = ctrl.losses;
+                uint32_t save_buys = ctrl.total_buys;
+                FPN<BACKTEST_FP> save_gw = ctrl.gross_wins, save_gl = ctrl.gross_losses;
+                uint64_t save_hold = ctrl.total_hold_ticks;
+                uint64_t save_total_ticks = ctrl.total_ticks;
 
-                // clear kill switch + all halts
-                ctrl.kill_switch_active = 0;
-                ctrl.kill_reason = 0;
-                ctrl.buying_halted = 0;
-                ctrl.halt_reason = 0;
-                ctrl.kill_recovery_counter = 0;
+                // --- save model handles (avoid leak + preserve ready flag) ---
+                ModelHandle<BACKTEST_FP> save_regime_model = ctrl.regime_model;
+                ModelHandle<BACKTEST_FP> save_peak_model = ctrl.peak_model;
+                ModelHandle<BACKTEST_FP> save_valley_model = ctrl.valley_model;
 
-                ctrl.session_high = price_d_last;
-                ctrl.session_low = price_d_last;
+                // --- save learning accumulators (cumulative, not session-local) ---
+                PortfolioController<BACKTEST_FP>::StrategyStats save_strats[5];
+                for (int s = 0; s < 5; s++) save_strats[s] = ctrl.strategy_stats[s];
+                BanditState save_bandit = ctrl.bandit;
+                ConfidenceScorer save_confidence = ctrl.confidence;
+                uint64_t save_pnc = ctrl.pred_norm_count;
+                double save_pnm = ctrl.pred_norm_mean;
+                double save_pnm2 = ctrl.pred_norm_m2;
+
+                // --- track overall max drawdown before per-day reset ---
+                if (FPN_GreaterThan(ctrl.max_drawdown, overall_max_drawdown))
+                    overall_max_drawdown = ctrl.max_drawdown;
+
+                // --- disable model loading during re-init (prevent handle leak) ---
+                int save_ml_backend = cfg.ml_backend;
+                int save_regime_backend = cfg.regime_model_backend;
+                int save_barrier_enabled = cfg.barrier_gate_enabled;
+                cfg.ml_backend = 0;
+                cfg.regime_model_backend = 0;
+                cfg.barrier_gate_enabled = 0;
+
+                // --- full re-init (matches live 23.5h reconnect) ---
+                PortfolioController_Init(&ctrl, cfg);
+
+                // --- restore config backends ---
+                cfg.ml_backend = save_ml_backend;
+                cfg.regime_model_backend = save_regime_backend;
+                cfg.barrier_gate_enabled = save_barrier_enabled;
+                ctrl.config = cfg;
+
+                // --- restore cumulative stats ---
+                ctrl.balance = save_balance;
+                ctrl.realized_pnl = save_rpnl;
+                ctrl.total_fees = save_fees;
+                ctrl.wins = save_wins; ctrl.losses = save_losses;
+                ctrl.total_buys = save_buys;
+                ctrl.gross_wins = save_gw; ctrl.gross_losses = save_gl;
+                ctrl.total_hold_ticks = save_hold;
+                ctrl.total_ticks = save_total_ticks;
+
+                // --- restore model handles ---
+                ctrl.regime_model = save_regime_model;
+                ctrl.peak_model = save_peak_model;
+                ctrl.valley_model = save_valley_model;
+
+                // --- restore learning accumulators ---
+                for (int s = 0; s < 5; s++) ctrl.strategy_stats[s] = save_strats[s];
+                ctrl.bandit = save_bandit;
+                ctrl.confidence = save_confidence;
+                ctrl.pred_norm_count = save_pnc;
+                ctrl.pred_norm_mean = save_pnm;
+                ctrl.pred_norm_m2 = save_pnm2;
+
+                // --- session tracking (no open positions after force-close) ---
+                ctrl.session_start_equity = ctrl.balance;
+                ctrl.peak_equity = ctrl.balance;
+                // session_high/low left at 0.0 — warmup re-seeds from new day's first tick
+
+                // --- seed time state for new day ---
+                ctrl.sim_time = (time_t)(tick_day / 1000000);
+                ctrl.last_slow_time = (uint64_t)ctrl.sim_time;
+                ctrl.regime.regime_start_time = ctrl.sim_time;
             }
             last_day_ms = tick_day;
 
@@ -521,6 +582,16 @@ static inline void Backtest_Run(BacktestResults *results, const BacktestRunConfi
             // core tick processing (same as main.cpp PortfolioController_Tick call)
             PortfolioController_Tick(&ctrl, &pool, tick.price, tick.volume,
                                      &log, tick.is_buyer_maker);
+
+            // bankruptcy early exit — if balance drops below 1% of starting,
+            // the run is dead. no point simulating 80 more days of nothing.
+            // saves massive time in optimizer sweeps with bad param combos.
+            if (FPN_LessThan(ctrl.balance, FPN_Mul(cfg.starting_balance,
+                    FPN_FromDouble<BACKTEST_FP>(0.01)))) {
+                fprintf(stderr, "[backtest] balance bankrupt — early exit at tick %lu\n",
+                        (unsigned long)ctrl.total_ticks);
+                goto done;
+            }
 
             // feed candle accumulator for chart (with historical timestamps)
             // throttle to every 100th tick — 1-min candles don't need every tick,
@@ -617,8 +688,10 @@ done:
     // sharpe from equity curve, drawdown from controller (equity = balance + positions)
     if (results->equity_count > 1)
         BacktestStats_ComputeFromEquity(&results->stats, results->equity_curve, results->equity_count);
-    // override equity-curve drawdown with controller's (tracks true equity, not just balance)
-    results->stats.max_drawdown = FPN_ToDouble(ctrl.max_drawdown);
+    // override equity-curve drawdown with overall max across all day resets
+    if (FPN_GreaterThan(ctrl.max_drawdown, overall_max_drawdown))
+        overall_max_drawdown = ctrl.max_drawdown;
+    results->stats.max_drawdown = FPN_ToDouble(overall_max_drawdown);
     double pe = FPN_ToDouble(ctrl.peak_equity);
     results->stats.max_drawdown_pct = (pe > 0.0)
         ? (results->stats.max_drawdown / pe) * 100.0 : 0.0;
@@ -700,6 +773,7 @@ struct WalkForwardResults {
     float std_val_accuracy;
     float mean_train_accuracy;
     int overfit_count;      // folds flagged as overfit
+    float avg_importance[MODEL_MAX_FEATURES]; // mean importance across valid folds
     double elapsed_ms;
     char fingerprint[65];   // SHA256 of config + data (empty if not computed)
 };
@@ -719,10 +793,70 @@ static inline float WalkForward_ComputeAccuracy(const float *predictions, const 
     return (float)correct / count;
 }
 
+//======================================================================================================
+// [FEATURE IMPORTANCE EXTRACTION]
+//======================================================================================================
+// extracts gain-based feature importance from an XGBoost booster by dumping the model
+// as text with stats and parsing gain= values per feature. gain importance measures how
+// much each feature improves predictions across all splits — more useful than weight
+// (split count) because it accounts for the quality of each split.
+//
+// output: importance[0..MODEL_NUM_FEATURES-1] normalized to sum to 1.0
+//======================================================================================================
+#ifdef USE_XGBOOST
+static inline void XGB_ExtractImportance(BoosterHandle booster, float *importance) {
+    memset(importance, 0, MODEL_MAX_FEATURES * sizeof(float));
+
+    bst_ulong num_trees;
+    const char **dump;
+    int ret = XGBoosterDumpModelEx(booster, "", 1, "text", &num_trees, &dump);
+    if (ret != 0 || num_trees == 0) return;
+
+    // parse each tree's text dump for [fN<...] gain=X patterns
+    // format: "N:[fIDX<THRESH] yes=Y,no=N,missing=M,gain=G,cover=C"
+    for (bst_ulong t = 0; t < num_trees; t++) {
+        const char *p = dump[t];
+        while (*p) {
+            // find "[f" which marks a split node
+            if (p[0] == '[' && p[1] == 'f') {
+                int feat_idx = atoi(p + 2);
+                if (feat_idx >= 0 && feat_idx < MODEL_NUM_FEATURES) {
+                    // find "gain=" after this split
+                    const char *g = strstr(p, "gain=");
+                    if (g) {
+                        float gain = (float)atof(g + 5);
+                        importance[feat_idx] += gain;
+                    }
+                }
+            }
+            p++;
+        }
+    }
+
+    // normalize to sum to 1.0
+    float total = 0;
+    for (int i = 0; i < MODEL_NUM_FEATURES; i++) total += importance[i];
+    if (total > 0) {
+        for (int i = 0; i < MODEL_NUM_FEATURES; i++) importance[i] /= total;
+    }
+}
+#endif
+
+struct XGBHyperparams {
+    int max_depth;
+    float learning_rate;
+    int n_estimators;
+    float subsample;
+    float colsample_bytree;
+    int min_child_weight;
+    float gamma;
+};
+
 static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
                                             const BacktestResults *data,
                                             int n_splits, int horizon_ticks,
                                             int buffer_ticks, int min_train_samples,
+                                            const XGBHyperparams *hp,
                                             volatile int *progress_pct,
                                             volatile int *cancel_flag) {
     memset(wf, 0, sizeof(*wf));
@@ -883,21 +1017,25 @@ static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
             continue;
         }
 
-        // training params — match the suite's existing training config
+        // training params — from GUI hyperparameters
+        char hp_depth[8]; snprintf(hp_depth, 8, "%d", hp->max_depth);
+        char hp_lr[16]; snprintf(hp_lr, 16, "%f", hp->learning_rate);
+        char hp_ss[16]; snprintf(hp_ss, 16, "%f", hp->subsample);
+        char hp_cs[16]; snprintf(hp_cs, 16, "%f", hp->colsample_bytree);
+        char hp_mcw[8]; snprintf(hp_mcw, 8, "%d", hp->min_child_weight);
+        char hp_gm[16]; snprintf(hp_gm, 16, "%f", hp->gamma);
         XGBoosterSetParam(booster, "objective", "binary:logistic");
-        XGBoosterSetParam(booster, "max_depth", "6");
-        XGBoosterSetParam(booster, "eta", "0.1");
-        XGBoosterSetParam(booster, "subsample", "0.8");
-        XGBoosterSetParam(booster, "colsample_bytree", "0.8");
-        XGBoosterSetParam(booster, "min_child_weight", "5");
-        XGBoosterSetParam(booster, "nthread", "1");
+        XGBoosterSetParam(booster, "max_depth", hp_depth);
+        XGBoosterSetParam(booster, "eta", hp_lr);
+        XGBoosterSetParam(booster, "subsample", hp_ss);
+        XGBoosterSetParam(booster, "colsample_bytree", hp_cs);
+        XGBoosterSetParam(booster, "min_child_weight", hp_mcw);
+        XGBoosterSetParam(booster, "gamma", hp_gm);
+        XGBoosterSetParam(booster, "nthread", "4");
         XGBoosterSetParam(booster, "verbosity", "0");
         XGBoosterSetParam(booster, "seed", "42");
 
-        // train with early stopping eval on test set
-        DMatrixHandle evals[] = { dtrain, dtest };
-        const char *eval_names[] = { "train", "val" };
-        int n_rounds = 200;
+        int n_rounds = hp->n_estimators;
 
         for (int r = 0; r < n_rounds; r++) {
             ret = XGBoosterUpdateOneIter(booster, r, dtrain);
@@ -928,8 +1066,8 @@ static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
 
         // feature importances (stability tracking hook)
         // XGBoost importance via dump → we use a simpler approach: score type
-        // for now, zero-fill — populated when we add importance extraction
-        memset(fr->feature_importances, 0, sizeof(fr->feature_importances));
+        // extract gain-based feature importance from this fold's model
+        XGB_ExtractImportance(booster, fr->feature_importances);
 
         fr->train_samples = n_train;
         fr->test_samples = n_test;
@@ -969,6 +1107,18 @@ static inline void Backtest_RunWalkForward(WalkForwardResults *wf,
         wf->mean_train_accuracy = sum_train / counted_folds;
         float var = (sum_val_sq / counted_folds) - (wf->mean_val_accuracy * wf->mean_val_accuracy);
         wf->std_val_accuracy = (var > 0.0f) ? (float)sqrt((double)var) : 0.0f;
+    }
+
+    // average feature importance across valid folds
+    memset(wf->avg_importance, 0, sizeof(wf->avg_importance));
+    if (counted_folds > 0) {
+        for (int f = 0; f < n_splits; f++) {
+            if (!wf->folds[f].valid) continue;
+            for (int j = 0; j < MODEL_NUM_FEATURES; j++)
+                wf->avg_importance[j] += wf->folds[f].feature_importances[j];
+        }
+        for (int j = 0; j < MODEL_NUM_FEATURES; j++)
+            wf->avg_importance[j] /= counted_folds;
     }
 
     gettimeofday(&t_end, NULL);
@@ -1139,6 +1289,33 @@ static inline void Backtest_RunSweep(OptimizerResults *opt,
                 opt->best_idx = idx;
             }
         }
+    }
+
+    // export results to CSV
+    mkdir("logging", 0755);
+    FILE *csv = fopen("logging/optimizer_results.csv", "w");
+    if (csv) {
+        // header
+        fprintf(csv, "%s", ranges[0].key);
+        if (num_params > 1) fprintf(csv, ",%s", ranges[1].key);
+        fprintf(csv, ",metric,pnl,return_pct,sharpe,profit_factor,expectancy,trades,win_rate,max_dd_pct,fees\n");
+        // rows
+        for (int i0 = 0; i0 < opt->dims[0]; i0++) {
+            int n1 = (num_params > 1) ? opt->dims[1] : 1;
+            for (int i1 = 0; i1 < n1; i1++) {
+                int idx = i0 * n1 + i1;
+                BacktestStats *s = &opt->stats[idx];
+                fprintf(csv, "%.4f", opt->param_vals[0][i0]);
+                if (num_params > 1) fprintf(csv, ",%.4f", opt->param_vals[1][i1]);
+                fprintf(csv, ",%.4f,%.2f,%.2f,%.3f,%.3f,%.4f,%u,%.1f,%.2f,%.2f\n",
+                        opt->metric[idx], s->total_pnl, s->return_pct,
+                        s->sharpe_ratio, s->profit_factor, s->expectancy,
+                        s->total_trades, s->win_rate, s->max_drawdown_pct, s->total_fees);
+            }
+        }
+        fclose(csv);
+        fprintf(stderr, "[optimizer] results saved to logging/optimizer_results.csv (%d runs)\n",
+                opt->total_runs);
     }
 }
 

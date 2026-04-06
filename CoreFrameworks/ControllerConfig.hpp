@@ -81,7 +81,7 @@ template <unsigned F> struct ControllerConfig {
   FPN<F> min_hold_gain_pct;   // only time-exit if gain < this % (e.g. 0.001 = 0.1%)
   // regime detection
   FPN<F> regime_slope_threshold;  // relative slope magnitude for TRENDING (legacy, kept for compat)
-  FPN<F> regime_crossover_threshold; // EMA/SMA spread for mild trend (e.g. 0.0005 = EMA Cross)
+  FPN<F> regime_crossover_threshold; // EMA/SMA spread for mild trend (e.g. 0.0005)
   FPN<F> regime_strong_crossover;   // EMA/SMA spread for strong trend (e.g. 0.0015 = Momentum)
   FPN<F> regime_r2_threshold;     // min R² for TRENDING (e.g. 0.70)
   FPN<F> regime_volatile_stddev;  // stddev/price ratio for VOLATILE (legacy, kept for compat)
@@ -99,7 +99,7 @@ template <unsigned F> struct ControllerConfig {
   FPN<F> momentum_breakout_mult;  // buy when price > avg + stddev * this (e.g. 1.5)
   FPN<F> momentum_tp_mult;        // TP multiplier for momentum (e.g. 3.0 stddevs)
   FPN<F> momentum_sl_mult;        // SL multiplier for momentum (e.g. 1.0 stddevs)
-  // EMA cross strategy
+  // EMA dip entry (buy below EMA in uptrend)
   FPN<F> emacross_dip_mult;       // buy this many stddevs below EMA (e.g. 0.5)
   FPN<F> emacross_crossover_min;  // min EMA-SMA spread for uptrend confirmation
   FPN<F> emacross_trail_mult;     // trailing TP factor when EMA rising
@@ -129,7 +129,7 @@ template <unsigned F> struct ControllerConfig {
   FPN<F> gate_ema_alpha;         // EMA smoothing factor (0.997 = ~333 tick window)
   FPN<F> gate_ema_one_minus_alpha; // precomputed 1.0 - alpha (avoid subtraction on hot path)
   // strategy selection
-  int default_strategy;          // -1=regime auto, 0=MR, 1=Momentum, 2=SimpleDip
+  int default_strategy;          // -1=regime auto, 0=MR, 1=Momentum
   // live trading
   int use_real_money;            // 0=paper (default), 1=real orders via REST API
   // kill switch (sticky — stays active until session reset or manual TUI 'k')
@@ -242,7 +242,7 @@ template <unsigned F> inline ControllerConfig<F> ControllerConfig_Default() {
   cfg.momentum_breakout_mult = FPN_FromDouble<F>(1.5);    // buy 1.5σ above avg
   cfg.momentum_tp_mult       = FPN_FromDouble<F>(3.0);    // wider TP for trends
   cfg.momentum_sl_mult       = FPN_FromDouble<F>(1.0);    // tighter SL than MR
-  // EMA cross strategy
+  // EMA dip entry
   cfg.emacross_dip_mult      = FPN_FromDouble<F>(0.5);    // buy 0.5σ below EMA
   cfg.emacross_crossover_min = FPN_FromDouble<F>(0.0003);  // 0.03% min spread
   cfg.emacross_trail_mult    = FPN_FromDouble<F>(1.5);    // 1.5x trail when EMA rising

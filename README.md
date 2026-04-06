@@ -22,7 +22,7 @@ Built from scratch as a learning project — no frameworks, no black boxes.
 
 ### Strategies & Regime Detection
 - **Regime detection**: EMA/SMA crossover with score-based classification (RANGING / TRENDING / TRENDING_DOWN / VOLATILE / MILD_TREND)
-- **4 strategies**: Mean Reversion, Momentum, SimpleDip, ML (model-driven) — extensible via StrategyInterface
+- **2 strategies**: Mean Reversion, Momentum — extensible via StrategyInterface
 - **Adaptive gates**: P&L regression shifts entry filters — winning = widen, losing = tighten
 - **Trailing TP/SL**: R²-scaled exit adjustment for momentum positions
 
@@ -115,7 +115,7 @@ SLOW PATH (every N ticks):
 
 ```
 CoreFrameworks/   OrderGates, Portfolio (bitmap), PortfolioController (feedback loop)
-Strategies/       RegimeDetector, MeanReversion, Momentum, SimpleDip, MLStrategy
+Strategies/       RegimeDetector, MeanReversion, Momentum
 ML_Headers/       RollingStats, ModelInference, BanditLearning, CostModel, VolScaler
 DataStream/       BinanceCrypto (websocket), EngineTUI (snapshot), TUIAnsi (renderer)
 FixedPoint/       FPN arbitrary-width fixed-point arithmetic library

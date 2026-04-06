@@ -107,9 +107,9 @@ static const CfgFieldDef field_defs[] = {
         "Signal must exceed fee_rate * this to trade\n3.0 = dip must be 3x round-trip fee cost"},
     // Regime Detection
     {"regime_crossover_threshold","Mild Trend","Regime Detection",CFG_FLOAT,"%.5f",
-        "EMA/SMA spread for MILD_TREND (EMA Cross)\n0.0005 = 0.05%% gap (~$35 at BTC $68k)\nbelow = RANGING, above = mild uptrend"},
+        "EMA/SMA spread for MILD_TREND regime\n0.0005 = 0.05%% gap (~$35 at BTC $68k)\nbelow = RANGING, above = mild uptrend"},
     {"regime_strong_crossover","Strong Trend","Regime Detection",CFG_FLOAT,"%.5f",
-        "EMA/SMA spread for strong TRENDING (Momentum)\n0.0015 = 0.15%% gap (~$102 at BTC $68k)\nabove = Momentum, below = EMA Cross"},
+        "EMA/SMA spread for strong TRENDING (Momentum)\n0.0015 = 0.15%% gap (~$102 at BTC $68k)\nabove = Momentum, below = MR"},
     {"regime_r2_threshold",   "R² Threshold", "Regime Detection", CFG_FLOAT, "%.1f",
         "Min R-squared consistency for TRENDING\n70 = 70%% of price variance explained by trend"},
     {"regime_vol_spike_ratio","Vol Spike",    "Regime Detection", CFG_FLOAT, "%.1f",
@@ -125,12 +125,12 @@ static const CfgFieldDef field_defs[] = {
         "Momentum SL distance in stddev units\nscaled by R-squared at fill time"},
     {"momentum_r2_min",       "R² Min",       "Momentum",        CFG_FLOAT, "%.2f",
         "Min R-squared to enter momentum trades\n0.4 = require 40%% trend consistency"},
-    // EMA Cross
-    {"emacross_dip_mult",     "Dip Mult",     "EMA Cross",       CFG_FLOAT, "%.2f",
+    // EMA Dip (entry below EMA in uptrend)
+    {"emacross_dip_mult",     "Dip Mult",     "EMA Dip",         CFG_FLOAT, "%.2f",
         "Buy this many stddevs below EMA\n0.5 = half sigma dip"},
-    {"emacross_crossover_min","Crossover Min", "EMA Cross",       CFG_FLOAT, "%.4f",
+    {"emacross_crossover_min","Crossover Min", "EMA Dip",         CFG_FLOAT, "%.4f",
         "Min EMA-SMA spread to confirm uptrend\n0.0003 = 0.03%%"},
-    {"emacross_trail_mult",   "Trail Mult",   "EMA Cross",       CFG_FLOAT, "%.2f",
+    {"emacross_trail_mult",   "Trail Mult",   "EMA Dip",         CFG_FLOAT, "%.2f",
         "Trailing TP factor when EMA rising\n1.5 = 50%% wider trail"},
     // Partial Exits
     {"partial_exit_pct",      "TP1 Split %%", "Partial Exits",   CFG_FLOAT, "%.2f",
@@ -153,7 +153,7 @@ static const CfgFieldDef field_defs[] = {
     {"session_overnight_mult","Overnight",    "Session Filters",  CFG_FLOAT, "%.2f", NULL},
     // Strategy
     {"default_strategy",      "Default##strat","Strategy",       CFG_INT,   "%d",
-        "-2 = Full Auto (MR+EMA Cross+Momentum+SimpleDip)\n-1 = Legacy Auto (MR+Momentum only)\n 0 = Mean Reversion\n 1 = Momentum\n 2 = Simple Dip\n 3 = ML\n 4 = EMA Cross"},
+        "-2 = Full Auto (MR+Momentum)\n-1 = Legacy Auto (MR+Momentum only)\n 0 = Mean Reversion\n 1 = Momentum"},
     // EMA Gate
     {"gate_ema_enabled",      "EMA Enabled",  "EMA Gate",        CFG_BOOL,  NULL,   NULL},
     {"gate_ema_alpha",        "Alpha",        "EMA Gate",        CFG_FLOAT, "%.4f",

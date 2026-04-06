@@ -718,7 +718,8 @@ static inline void GUI_PriceChart(const ChartState *cs, const TUISnapshot *snap,
         }
 
         // buy gate threshold — cyan, thick dotted, distinct from entry/TP/SL
-        if (snap->buy_p > 0.01) {
+        // suppressed in backtest: static snapshot value is misleading (shows final state)
+        if (snap->buy_p > 0.01 && !snap->is_backtest) {
             ImVec2 left  = ImPlot::PlotToPixels(cs->x_lo, snap->buy_p);
             ImVec2 right = ImPlot::PlotToPixels(cs->x_hi, snap->buy_p);
             ImU32 gate_col = ImGui::GetColorU32(ImVec4(
@@ -863,7 +864,7 @@ static inline void GUI_VolumeChart(const ChartState *cs, const TUISnapshot *snap
                               ImGui::GetColorU32(col));
         }
         // volume gate threshold — cyan dot-dash, matching price chart gate style
-        if (snap->buy_v > 0.0001) {
+        if (snap->buy_v > 0.0001 && !snap->is_backtest) {
             ImVec2 left  = ImPlot::PlotToPixels(cs->x_lo, snap->buy_v);
             ImVec2 right = ImPlot::PlotToPixels(cs->x_hi, snap->buy_v);
             ImU32 gate_col = ImGui::GetColorU32(ImVec4(

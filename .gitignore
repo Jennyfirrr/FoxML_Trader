@@ -24,3 +24,4 @@ Strategies/MeanReversion.hpp
 Strategies/Momentum.hpp
 Strategies/SimpleDip.hpp
 Strategies/MLStrategy.hpp
+build_test/
